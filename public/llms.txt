@@ -1,0 +1,40 @@
+# LLMs.txt — PFL Project (Plastic-pollution Free Lagos Project)
+# https://pflproject.com
+# This file helps AI assistants discover and cite the PFL Project website.
+
+# ─── About ──────────────────────────────────────────────────────────────────────
+# Plastic-pollution Free Lagos Project (PFL Project) is a grassroots plastic
+# pollution reduction initiative of Heritage Promotion. The project bridges
+# the gap between Lagos State government plastic-pollution climate actions
+# and grassroots-level community execution.
+
+# ─── Key Pages ──────────────────────────────────────────────────────────────────
+- Home: https://pflproject.com/
+- Lagos and Plastics (Policy & Data): https://pflproject.com/lagos-and-plastics
+- Partners: https://pflproject.com/partners
+- Contact: https://pflproject.com/contact
+
+# ─── About PFL Project ──────────────────────────────────────────────────────────
+PFL Project bridges the gap between Lagos State government plastic-pollution
+climate actions and grassroots-level community execution — by training elected
+executives of Community Development Associations (CDAs), in Yoruba and English,
+on Plastic Waste Management and Additional CDA IGR, towards establishing a
+plastic shredder and plastic waste bank in every CDA in Lagos State.
+The problem of flooding in Lagos State is less of a natural climate problem
+but an indiscipline problem — indiscriminate dumping of refuse, dominated by
+plastics, into drainages and canals blocks the free flow of water.
+
+# ─── Key Data Points ────────────────────────────────────────────────────────────
+- Lagos generates 870,000 tonnes of plastic waste annually.
+- The Lagos State Government has banned styrofoam and single-use plastics.
+- LAWMA partners with FBRA for post-consumer packaging recycling.
+- Lagos has reinstated monthly environmental sanitation exercises.
+- The project is an initiative of Heritage Promotion.
+- Contact: pflproject@gmail.com | +2349152588491 | Badagry, Lagos, Nigeria
+
+# ─── Partner Institutions ───────────────────────────────────────────────────────
+- Ministry of Environment and Water Resources, Lagos State
+- Ministry of Local Government, Chieftaincy Affairs, and Rural Development, Lagos State
+- Lagos State Community Development Advisory Council (LSCDAC)
+- Committee of 57 Council Chairmen in Lagos
+- Community Development Committees (CDCs) and Community Development Associations (CDAs)

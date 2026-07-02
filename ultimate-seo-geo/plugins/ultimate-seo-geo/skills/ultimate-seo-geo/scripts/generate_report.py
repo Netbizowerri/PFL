@@ -1,0 +1,2265 @@
+#!/usr/bin/env python3
+"""
+Generate an interactive SEO report (HTML, XLSX, PDF, or combined).
+
+Runs all analysis scripts and aggregates results into a single,
+self-contained interactive HTML file with a premium dashboard UI.
+Optionally exports to Excel (.xlsx) or PDF for offline sharing.
+
+Usage:
+    python generate_report.py https://example.com
+    python generate_report.py https://example.com --output my-report.html
+    python generate_report.py https://example.com --crawl-deep --crawl-max-pages 40
+    python generate_report.py https://example.com --format xlsx --output report.xlsx
+    python generate_report.py https://example.com --format pdf --output report.pdf
+    python generate_report.py https://example.com --format all --output report
+
+PDF requires optional WeasyPrint (see requirements.txt). Without it, use HTML + browser Print → Save as PDF.
+
+`--crawl-deep` runs broken_links and canonical_checker in multi-page crawl mode (capped); slower and
+more load on the target host than the default single-URL checks.
+"""
+
+import argparse
+import html as html_lib
+import json
+import os
+from typing import Optional
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from urllib.parse import urlparse
+
+from fetch_page import fetch_page as fetch_url
+
+# Maximum number of analysis scripts to run in parallel.
+# Bounded to avoid overwhelming the target server with simultaneous crawls.
+_MAX_PARALLEL_SCRIPTS = 8
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_TIMEOUT_DEFAULT = 120
+_SCRIPT_TIMEOUT_CRAWL = 300
+
+
+def _needs_raw_html_disclaimer(env: dict) -> bool:
+    """True when the stack often injects title/meta/canonical client-side."""
+    p = (env or {}).get("primary", "")
+    r = str((env or {}).get("runtime", ""))
+    return p in ("Next.js", "Nuxt") or "JavaScript" in r
+
+
+def run_script(script_name: str, args: list, timeout: int = 120) -> dict:
+    """Run an analysis script and capture JSON output."""
+    script_path = os.path.join(SCRIPT_DIR, script_name)
+    if not os.path.exists(script_path):
+        return {"error": f"Script {script_name} not found"}
+
+    cmd = [sys.executable, script_path] + args + ["--json"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+        err_msg = result.stderr.strip() or f"Exit code {result.returncode}"
+        return {"error": f"[{script_name}] {err_msg}"}
+    except subprocess.TimeoutExpired:
+        return {"error": f"Script timed out after {timeout}s"}
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON output from script"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def fetch_page(url: str, render: str = "never") -> str:
+    """Fetch page HTML to a temp file, return path."""
+    fetched = fetch_url(url, timeout=20, render=render)
+    if fetched.get("error") or not fetched.get("content"):
+        return ""
+    tmp = tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8")
+    tmp.write(fetched["content"])
+    tmp.close()
+    return tmp.name
+
+
+def detect_environment(html_text: str, url: str) -> dict:
+    """Infer site environment/CMS/framework from source signals."""
+    lower = (html_text or "").lower()
+    domain = urlparse(url).netloc.lower()
+    scores = {}
+    reasons = {}
+
+    def hit(name: str, points: int, reason: str):
+        scores[name] = scores.get(name, 0) + points
+        reasons.setdefault(name, []).append(reason)
+
+    # Managed CMS signals
+    if any(s in lower for s in ("bloggerusercontent.com", "www.blogger.com", "data:blog.", "b:skin")):
+        hit("Blogger", 6, "Blogger template/assets detected")
+    if domain.endswith("blogspot.com"):
+        hit("Blogger", 4, "Blogspot domain detected")
+
+    if any(s in lower for s in ("wp-content/", "wp-includes/", "wp-json")):
+        hit("WordPress", 6, "WordPress core paths detected")
+    if re.search(r'generator[^>]+wordpress', lower):
+        hit("WordPress", 3, "WordPress generator meta detected")
+
+    if any(s in lower for s in ("cdn.shopify.com", "shopify.theme", "shopify-section")):
+        hit("Shopify", 6, "Shopify assets/theme markers detected")
+
+    if any(s in lower for s in ("wixstatic.com", "wix.com", "wixsite")):
+        hit("Wix", 6, "Wix assets detected")
+
+    if any(s in lower for s in ("webflow", "w-webflow")):
+        hit("Webflow", 5, "Webflow markers detected")
+
+    if any(s in lower for s in ("squarespace.com", "static1.squarespace")):
+        hit("Squarespace", 6, "Squarespace assets detected")
+
+    if re.search(r'generator[^>]+ghost', lower) or "ghost/" in lower:
+        hit("Ghost", 5, "Ghost generator/assets detected")
+
+    # Framework signals
+    if any(s in lower for s in ("/_next/", "__next_data__")):
+        hit("Next.js", 6, "Next.js runtime/build markers detected")
+    if any(s in lower for s in ("/_nuxt/", "__nuxt")):
+        hit("Nuxt", 6, "Nuxt runtime/build markers detected")
+
+    if not scores:
+        return {
+            "primary": "Unknown",
+            "runtime": "Unknown",
+            "confidence": "low",
+            "signals": ["No strong CMS/framework markers were found in HTML source."],
+            "alternatives": [],
+        }
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    primary, top_score = ranked[0]
+    confidence = "high" if top_score >= 8 else "medium" if top_score >= 5 else "low"
+    runtime_map = {
+        "Blogger": "Managed CMS",
+        "WordPress": "Managed CMS",
+        "Shopify": "Managed CMS / Commerce",
+        "Wix": "Managed CMS",
+        "Webflow": "Managed CMS",
+        "Squarespace": "Managed CMS",
+        "Ghost": "Managed CMS",
+        "Next.js": "JavaScript Framework",
+        "Nuxt": "JavaScript Framework",
+    }
+    return {
+        "primary": primary,
+        "runtime": runtime_map.get(primary, "Unknown"),
+        "confidence": confidence,
+        "signals": reasons.get(primary, [])[:5],
+        "alternatives": [name for name, _ in ranked[1:3]],
+    }
+
+
+def _platform_hint(primary: str, area: str) -> str:
+    """Provide platform-specific implementation guidance."""
+    blogger = {
+        "metadata": "In Blogger, update Theme -> Edit HTML and add tags in the <head> section (title template, meta description, OG/Twitter tags).",
+        "heading": "In Blogger templates, keep exactly one content H1 per page (post title on posts, site headline on homepage).",
+        "headers": "Blogger cannot set most response headers directly. Add Cloudflare in front and configure Response Header Transform Rules.",
+        "llms": "Blogger cannot natively serve arbitrary root files. Serve /llms.txt via Cloudflare Workers/Pages or reverse-proxy route.",
+        "links": "Fix broken internal links in post content and navigation widgets; update outdated post URLs and labels.",
+        "performance": "Optimize Blogger theme widgets/scripts, compress hero/media assets, and defer non-critical third-party scripts.",
+    }
+    wordpress = {
+        "metadata": "Use your SEO plugin (Yoast/RankMath/AIOSEO) or theme templates to set title/meta and OG/Twitter tags.",
+        "heading": "Ensure one H1 in theme templates and avoid duplicate H1 in builders/widgets.",
+        "headers": "Set headers via server config (Nginx/Apache) or CDN edge rules.",
+        "llms": "Create /llms.txt at web root or route it through your web server.",
+        "links": "Fix links in menus, content blocks, and internal link plugin data.",
+        "performance": "Use caching, image optimization, script deferral, and CWV-focused plugin settings.",
+    }
+    nextjs = {
+        "metadata": "Use the Next.js Metadata API (`app/`) or `next/head` (`pages/`) for title/meta/OG/Twitter tags.",
+        "heading": "Set a single semantic H1 in each route component.",
+        "headers": "Set security headers in `next.config.js` `headers()` or at your edge/CDN.",
+        "llms": "Serve `/llms.txt` from `/public/llms.txt`.",
+        "links": "Fix links in route components and content source files; validate with link checks in CI.",
+        "performance": "Use `next/image`, dynamic imports, script strategy controls, and reduce main-thread JS.",
+    }
+    fallback = {
+        "metadata": "Update page templates to set complete title/meta/OG/Twitter tags.",
+        "heading": "Ensure each page has exactly one descriptive H1 aligned to intent.",
+        "headers": "Set missing security headers at web server or CDN layer.",
+        "llms": "Add `/llms.txt` at site root with concise site description and key URLs.",
+        "links": "Repair or remove broken internal links and refresh outdated navigation targets.",
+        "performance": "Compress critical assets, reduce render-blocking scripts, and optimize CWV bottlenecks.",
+    }
+
+    platform_map = {
+        "Blogger": blogger,
+        "WordPress": wordpress,
+        "Shopify": fallback,
+        "Wix": fallback,
+        "Webflow": fallback,
+        "Squarespace": fallback,
+        "Ghost": fallback,
+        "Next.js": nextjs,
+        "Nuxt": nextjs,
+    }
+    return platform_map.get(primary, fallback).get(area, fallback.get(area, ""))
+
+
+def build_environment_fixes(data: dict) -> list:
+    """Build actionable issue fixes tailored to detected environment."""
+    env = data.get("environment", {})
+    platform = env.get("primary", "Unknown")
+    fixes = []
+
+    def add(
+        severity: str,
+        title: str,
+        reason: str,
+        fix: str,
+        dependency: str = "Confirm the affected page template or CMS setting before editing.",
+        failure_check: str = "Rerun the same audit check; this finding should disappear or downgrade.",
+        leading_indicator: str = "Critical/warning count for this section declines in the next report.",
+    ):
+        fixes.append({
+            "severity": severity,
+            "title": title,
+            "reason": reason,
+            "fix": fix,
+            "dependency": dependency,
+            "failure_check": failure_check,
+            "leading_indicator": leading_indicator,
+        })
+
+    op = data["sections"].get("onpage", {})
+    sec = data["sections"].get("security", {})
+    soc = data["sections"].get("social", {})
+    llm = data["sections"].get("llms_txt", {})
+    bl = data["sections"].get("broken_links", {})
+    rd = data["sections"].get("readability", {})
+    psi = data["sections"].get("pagespeed", {})
+
+    title = (op.get("title") or "").strip()
+    meta = (op.get("meta_description") or "").strip()
+    h1s = op.get("h1", []) if isinstance(op.get("h1"), list) else []
+
+    if not h1s:
+        add(
+            "critical",
+            "Missing H1 on page",
+            "No primary content heading was detected, which weakens topical clarity.",
+            _platform_hint(platform, "heading"),
+        )
+
+    if not meta or len(meta) < 110 or len(meta) > 170:
+        add(
+            "warning",
+            "Meta description is missing or out of range",
+            "This can reduce SERP CTR and snippet quality.",
+            _platform_hint(platform, "metadata"),
+        )
+
+    if not title or len(title) < 30 or len(title) > 65:
+        add(
+            "warning",
+            "Title tag needs optimization",
+            "Title length/content is likely suboptimal for rankings and click-through.",
+            _platform_hint(platform, "metadata"),
+        )
+
+    missing_headers = sec.get("headers_missing", {})
+    if missing_headers:
+        add(
+            "critical" if len(missing_headers) >= 4 else "warning",
+            f"{len(missing_headers)} security headers missing",
+            "Missing headers reduce trust and can expose the site to browser/security risks.",
+            _platform_hint(platform, "headers"),
+        )
+
+    if not llm.get("exists"):
+        add(
+            "warning",
+            "No llms.txt found",
+            "AI coding agents have no curated machine-readable guidance for key pages. Do not treat llms.txt as a confirmed AI-search ranking or citation lever.",
+            _platform_hint(platform, "llms"),
+            leading_indicator="/llms.txt returns 200 and is well-formed; AI-search visibility is still measured through crawler access, indexation, entities, and citations.",
+        )
+
+    broken_count = bl.get("summary", {}).get("broken", 0)
+    soft_404_count = bl.get("summary", {}).get("soft_404s", 0)
+    if broken_count > 0:
+        add(
+            "critical" if broken_count >= 5 else "warning",
+            f"{broken_count} broken links detected",
+            "Broken internal links hurt crawl flow and user trust.",
+            _platform_hint(platform, "links"),
+        )
+    if soft_404_count > 0:
+        add(
+            "warning",
+            f"{soft_404_count} soft 404(s) detected",
+            "Pages returning 200 but showing 'not found' content waste crawl budget.",
+            "Return a real 404/410 status code for pages that don't exist. Update internal links to remove references to these pages.",
+        )
+
+    sm = data["sections"].get("sitemap", {})
+    sm_health = sm.get("url_health", {})
+    sm_404s = len(sm_health.get("not_found_404", []))
+    sm_soft = len(sm_health.get("soft_404s", []))
+    sm_patterns = sm.get("url_patterns", {})
+    sm_templates = len(sm_patterns.get("template_urls", []))
+    sm_search = len(sm_patterns.get("search_urls", []))
+    if sm_404s > 0:
+        add(
+            "critical",
+            f"{sm_404s} sitemap URL(s) return 404",
+            "Sitemap URLs returning 404 waste crawl budget and appear as errors in Google Search Console.",
+            "Remove 404 URLs from sitemap. If content moved, add 301 redirects. Fix internal links pointing to dead pages.",
+        )
+    if sm_soft > 0:
+        add(
+            "warning",
+            f"{sm_soft} sitemap URL(s) are soft 404s",
+            "Pages in sitemap returning 200 but showing 'not found' content confuse search engines.",
+            "Return real 404/410 status codes for dead pages, or restore genuine content.",
+        )
+    if sm_templates > 0 or sm_search > 0:
+        add(
+            "critical" if sm_templates > 0 else "warning",
+            f"Problematic URLs in sitemap ({'template placeholders' if sm_templates else 'search result pages'})",
+            "Search result and template URLs should never be in sitemaps — they waste crawl budget and dilute indexation.",
+            "Remove search/template URLs from sitemap. Add noindex to search result pages. Block via robots.txt if needed.",
+        )
+
+    can = data["sections"].get("canonical", {})
+    can_issues = can.get("issues", []) if isinstance(can.get("issues"), list) else []
+    can_critical = sum(1 for i in can_issues if isinstance(i, dict) and i.get("severity") in ("critical", "high"))
+    if can_critical > 0:
+        add(
+            "critical",
+            f"{can_critical} canonical tag issue(s) detected",
+            "Canonical tag problems cause 'Google chose different canonical' errors in Search Console.",
+            "Ensure every page has a single, absolute, self-referencing canonical with consistent protocol (HTTPS) and domain (www vs non-www). Fix any canonical pointing to a redirect or 404.",
+        )
+    elif not can.get("canonical") and not can.get("error"):
+        add(
+            "warning",
+            "Missing canonical tag",
+            "Without a canonical tag, Google decides which URL to index — often choosing wrong.",
+            "Add <link rel=\"canonical\" href=\"[absolute-self-url]\"> to every indexable page.",
+        )
+
+    il = data["sections"].get("internal_links", {})
+    il_redirected = len(il.get("redirected_pages", []))
+    if il_redirected > 0:
+        add(
+            "warning" if il_redirected < 5 else "critical",
+            f"{il_redirected} internal link(s) point to redirect URLs",
+            "GSC reports these as 'Page with redirect'. Stale links waste crawl budget and dilute link equity.",
+            "Update all internal links to point to the final destination URL. Remove redirect URLs from sitemap.",
+        )
+
+    # Programmatic SEO issues
+    pseo = data["sections"].get("programmatic_seo", {})
+    if pseo and not pseo.get("error") and pseo.get("pattern_groups_found", 0) > 0:
+        pseo_crit = pseo.get("total_critical_issues", 0)
+        pseo_warn = pseo.get("total_warnings", 0)
+        if pseo_crit > 0:
+            add(
+                "critical",
+                f"{pseo_crit} critical programmatic SEO issue(s) detected",
+                "Template pages have scaled content abuse risk (low uniqueness, duplicate titles, thin content).",
+                "Add genuinely unique per-page content. Each page needs ≥40% unique content and unique title/H1/meta.",
+            )
+        elif pseo_warn > 2:
+            add(
+                "warning",
+                f"{pseo_warn} programmatic SEO warnings",
+                "Template pages have quality concerns that could trigger Google's Helpful Content system.",
+                "Review template pages for content differentiation and internal linking.",
+            )
+
+    can_alt = can.get("summary", {}).get("alternate_pages", 0) if isinstance(can.get("summary"), dict) else 0
+    if can_alt > 0:
+        add(
+            "warning" if can_alt < 10 else "critical",
+            f"{can_alt} page(s) flagged as 'Alternate page with proper canonical'",
+            "These pages have non-self-referencing canonicals — Google won't index them.",
+            "If pages have unique content, change canonical to self-referencing. If true duplicates, consider 301 redirect to canonical target.",
+        )
+
+    il_broken = len(il.get("broken_internal_pages", []))
+    il_soft = len(il.get("soft_404_pages", []))
+    if il_broken > 0:
+        add(
+            "critical",
+            f"{il_broken} internal page(s) return 404 during crawl",
+            "Internal pages returning 404 break user journeys and waste link equity.",
+            _platform_hint(platform, "links"),
+        )
+    if il_soft > 0:
+        add(
+            "warning",
+            f"{il_soft} internal page(s) are soft 404s",
+            "Soft 404 pages look broken to search engines despite returning HTTP 200.",
+            "Return real 404/410 status codes or restore genuine content on these pages.",
+        )
+
+    og_missing = soc.get("og_missing", [])
+    tw_missing = soc.get("twitter_missing", [])
+    if og_missing or tw_missing:
+        add(
+            "warning",
+            "Social meta tags are incomplete",
+            "Missing OG/Twitter tags weakens social previews and share quality.",
+            _platform_hint(platform, "metadata"),
+        )
+
+    if psi.get("error"):
+        add(
+            "info",
+            "Performance measurement incomplete",
+            "PageSpeed API returned an error, so CWV recommendations are less reliable.",
+            "Rerun `pagespeed.py` with `--api-key` and then prioritize LCP/INP/CLS fixes from that output.",
+        )
+
+    if rd.get("flesch_reading_ease", 100) < 40 or rd.get("avg_sentence_length", 0) > 25:
+        add(
+            "warning",
+            "Content readability is difficult",
+            "Long, complex text can reduce engagement and comprehension.",
+            "Rewrite key sections with shorter sentences (15-20 words), shorter paragraphs (2-4 sentences), and clearer subheadings.",
+        )
+
+    if not fixes:
+        add(
+            "pass",
+            "No major implementation blockers detected",
+            "Core checks look healthy for current scope.",
+            "Continue monitoring with regular crawls and keep metadata/security/performance baselines in CI.",
+        )
+
+    return fixes
+
+
+def render_environment_fixes(fixes: list) -> str:
+    """Render environment-specific fixes for HTML output."""
+    if not fixes:
+        return '<p style="color:var(--green)">✅ No environment-specific fixes needed.</p>'
+
+    severity_order = {"critical": 0, "warning": 1, "info": 2, "pass": 3}
+    html = ""
+    for item in sorted(fixes, key=lambda x: severity_order.get(x.get("severity", "info"), 9)):
+        sev = item.get("severity", "info")
+        badge = sev.upper()
+        title = html_lib.escape(item.get("title", ""), quote=True)
+        reason = html_lib.escape(item.get("reason", ""), quote=True)
+        fix = html_lib.escape(item.get("fix", ""), quote=True)
+        dependency = html_lib.escape(item.get("dependency", ""), quote=True)
+        failure_check = html_lib.escape(item.get("failure_check", ""), quote=True)
+        leading_indicator = html_lib.escape(item.get("leading_indicator", ""), quote=True)
+        metadata = ""
+        if dependency or failure_check or leading_indicator:
+            metadata = (
+                '<div style="margin-top:8px;color:var(--text-muted);font-size:0.82rem">'
+                f'{f"<div><strong>Dependency:</strong> {dependency}</div>" if dependency else ""}'
+                f'{f"<div><strong>Failure check:</strong> {failure_check}</div>" if failure_check else ""}'
+                f'{f"<div><strong>Leading indicator:</strong> {leading_indicator}</div>" if leading_indicator else ""}'
+                '</div>'
+            )
+        html += (
+            f'<div class="issue-item {sev if sev in ("critical","warning","info") else "info"}">'
+            f'<span class="issue-badge">{badge}</span>'
+            f'<div><strong>{title}</strong><br>'
+            f'<span style="color:var(--text-muted)">{reason}</span><br>'
+            f'<span><strong>Fix:</strong> {fix}</span>{metadata}</div></div>'
+        )
+    return html
+
+
+def _recommendation_metadata(issue: dict, section_name: str) -> dict:
+    """Attach falsifiable recommendation metadata to structured findings."""
+    dependency = (
+        issue.get("dependency")
+        or issue.get("depends_on")
+        or "Verify the affected page, template, or data source before changing production output."
+    )
+    failure_check = (
+        issue.get("failure_check")
+        or issue.get("how_to_know_failed")
+        or issue.get("validation")
+        or f"Rerun the {section_name} check; this finding should disappear, downgrade, or show improved evidence."
+    )
+    leading_indicator = (
+        issue.get("leading_indicator")
+        or issue.get("metric")
+        or f"Next audit shows fewer warnings in {section_name} and no new dependent regressions."
+    )
+    return {
+        "dependency": dependency,
+        "failure_check": failure_check,
+        "leading_indicator": leading_indicator,
+    }
+
+
+def _render_issue_metadata(issue: dict) -> str:
+    parts = []
+    for label, key in (
+        ("Dependency", "dependency"),
+        ("Failure check", "failure_check"),
+        ("Leading indicator", "leading_indicator"),
+    ):
+        value = html_lib.escape(str(issue.get(key, "")), quote=True)
+        if value:
+            parts.append(f"<div><strong>{label}:</strong> {value}</div>")
+    if not parts:
+        return ""
+    return '<div style="margin-top:8px;color:var(--text-muted);font-size:0.82rem">' + "".join(parts) + "</div>"
+
+
+def collect_data(
+    url: str,
+    *,
+    crawl_deep: bool = False,
+    crawl_max_pages: int = 30,
+    crawl_depth: int = 2,
+    render: str = "never",
+) -> dict:
+    """Run all analysis scripts and collect results."""
+    print(f"🔍 Analyzing {url}...")
+    if crawl_deep:
+        print(
+            f"  📎 --crawl-deep: broken links + canonical checks use multi-page crawl "
+            f"(depth={crawl_depth}, max_pages={crawl_max_pages}); slower and more server load."
+        )
+    data = {
+        "url": url,
+        "domain": urlparse(url).netloc,
+        "timestamp": datetime.now().isoformat(),
+        "sections": {},
+        "crawl_deep": crawl_deep,
+        "crawl_max_pages": crawl_max_pages,
+        "crawl_depth": crawl_depth,
+        "render_mode": render,
+    }
+
+    # Fetch page for parse_html and readability
+    print("  ⏳ Fetching page HTML...")
+    html_path = fetch_page(url, render=render)
+    page_html = ""
+    if html_path and os.path.exists(html_path):
+        try:
+            with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
+                page_html = f.read()
+        except OSError:
+            page_html = ""
+    data["environment"] = detect_environment(page_html, url)
+
+    broken_args = [url, "--workers", "5", "--timeout", "8"]
+    if crawl_deep:
+        broken_args.extend(
+            ["--crawl", "--depth", str(crawl_depth), "--max-pages", str(crawl_max_pages)]
+        )
+
+    canonical_args = [url]
+    if crawl_deep:
+        canonical_args.extend(
+            ["--crawl", "--depth", str(crawl_depth), "--max-pages", str(crawl_max_pages)]
+        )
+
+    analyses = [
+        ("robots", "robots_checker.py", [url]),
+        ("security", "security_headers.py", [url]),
+        ("social", "social_meta.py", [url]),
+        ("redirects", "redirect_checker.py", [url]),
+        ("llms_txt", "llms_txt_checker.py", [url]),
+        ("broken_links", "broken_links.py", broken_args),
+        ("internal_links", "internal_links.py", [url, "--depth", "1", "--max-pages", "15"]),
+        ("pagespeed", "pagespeed.py", [url, "--strategy", "mobile"]),
+        # New analysis scripts (supplementary — failures don't block report)
+        ("entity", "entity_checker.py", [url]),
+        ("link_profile", "link_profile.py", [url, "--max-pages", "20"]),
+        ("hreflang", "hreflang_checker.py", [url]),
+        ("duplicate_content", "duplicate_content.py", [url]),
+        ("content_quality", "content_quality.py", [url]),
+        ("sitemap", "sitemap_checker.py", [url]),
+        ("canonical", "canonical_checker.py", canonical_args),
+        ("programmatic_seo", "programmatic_seo_auditor.py", [url, "--max-pages", "80"]),
+        ("local_signals", "local_signals_checker.py", [url]),
+        ("indexnow_probe", "indexnow_checker.py", [url, "--probe"]),
+    ]
+
+    # Add parse_html and readability if page was fetched
+    if html_path:
+        analyses.append(("onpage", "parse_html.py", [html_path, "--url", url]))
+        analyses.append(("readability", "readability.py", [html_path]))
+        analyses.append(("article", "article_seo.py", [url]))
+
+    # Merge HTML-file-based checks into the same parallel batch.
+    # html_path is already written to disk at this point, so all tasks are
+    # ready to run concurrently.
+    if html_path and os.path.exists(html_path):
+        analyses.append(("schema_validation", "validate_schema.py", [html_path]))
+        analyses.append(("image_seo", "image_checker.py", [html_path, "--base-url", url]))
+
+    def _run_one(item: tuple) -> tuple:
+        name, script, args = item
+        start = time.time()
+        timeout = (
+            _SCRIPT_TIMEOUT_CRAWL
+            if crawl_deep and name in ("broken_links", "canonical")
+            else _SCRIPT_TIMEOUT_DEFAULT
+        )
+        result = run_script(script, args, timeout=timeout)
+        elapsed = round(time.time() - start, 1)
+        return name, script, result, elapsed
+
+    print(f"  ⏳ Running {len(analyses)} checks in parallel (max {_MAX_PARALLEL_SCRIPTS} workers)...")
+    with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_SCRIPTS) as pool:
+        futures = {pool.submit(_run_one, item): item for item in analyses}
+        for fut in as_completed(futures):
+            name, script, result, elapsed = fut.result()
+            data["sections"][name] = result
+            status = "⚠️ error" if "error" in result and result.get("error") else "✅"
+            print(f"  {status} {script} ({elapsed}s)")
+
+    # Prefer canonical_checker URL when raw HTML had no <link rel="canonical">
+    op = data["sections"].get("onpage", {})
+    cansec = data["sections"].get("canonical", {})
+    if isinstance(op, dict) and not op.get("error") and not (op.get("canonical") or "").strip():
+        c = cansec.get("canonical") if isinstance(cansec, dict) else None
+        if c:
+            op = dict(op)
+            op["canonical"] = c
+            op["canonical_from_audit"] = True
+            data["sections"]["onpage"] = op
+
+    # Cleanup temp file
+    if html_path and os.path.exists(html_path):
+        os.unlink(html_path)
+
+    data["environment_fixes"] = build_environment_fixes(data)
+
+    return data
+
+
+def calculate_overall_score(data: dict) -> dict:
+    """Calculate overall SEO score from all analyses."""
+    scores = {}
+    weights = {
+        "security": 8,
+        "social": 5,
+        "robots": 8,
+        "broken_links": 10,
+        "internal_links": 8,
+        "redirects": 3,
+        "llms_txt": 5,
+        "pagespeed": 13,
+        "onpage": 10,
+        "readability": 8,
+        "entity": 5,
+        "link_profile": 7,
+        "hreflang": 5,
+        "duplicate_content": 5,
+        "content_quality": 6,
+        "programmatic_seo": 4,
+        "schema_validation": 5,
+        "image_seo": 3,
+        "canonical": 7,
+        "sitemap": 3,
+        "local_signals": 3,
+        "indexnow_probe": 2,
+    }
+
+    # Security score
+    sec = data["sections"].get("security", {})
+    scores["security"] = sec.get("score", 0)
+
+    # Social meta score
+    soc = data["sections"].get("social", {})
+    scores["social"] = soc.get("score", 0)
+
+    # Robots score
+    rob = data["sections"].get("robots", {})
+    if rob.get("status") == 200:
+        base = 60
+        if rob.get("sitemaps"):
+            base += 20
+        ai_managed = sum(1 for s in rob.get("ai_crawler_status", {}).values()
+                         if "not managed" not in s)
+        base += min(20, ai_managed * 2)
+        scores["robots"] = min(100, base)
+    elif rob.get("status") == 404:
+        scores["robots"] = 20
+    else:
+        scores["robots"] = 0
+
+    # Article score (informational, not weighted heavily)
+    art = data["sections"].get("article", {})
+    if art and not art.get("error"):
+        art_score = 50
+        if art.get("target_keyword"): art_score += 25
+        if art.get("lsi_keywords"): art_score += 25
+        scores["article"] = min(100, art_score)
+    else:
+        scores["article"] = 0
+
+    # Broken links score (includes soft 404s)
+    bl = data["sections"].get("broken_links", {})
+    summary = bl.get("summary", {})
+    total = summary.get("total", 1) or 1
+    broken = summary.get("broken", 0)
+    soft_404s = summary.get("soft_404s", 0)
+    scores["broken_links"] = max(0, 100 - int(((broken + soft_404s) / total) * 300))
+
+    # Internal links score (penalize broken/soft-404/redirect pages)
+    il = data["sections"].get("internal_links", {})
+    il_issues = len(il.get("issues", []))
+    il_broken_pages = len(il.get("broken_internal_pages", []))
+    il_soft_404_pages = len(il.get("soft_404_pages", []))
+    il_redirected_pages = len(il.get("redirected_pages", []))
+    il_penalty = (il_issues * 10 + il_broken_pages * 15
+                  + il_soft_404_pages * 10 + il_redirected_pages * 5)
+    scores["internal_links"] = max(0, 100 - il_penalty)
+
+    # Redirects score
+    red = data["sections"].get("redirects", {})
+    red_issues = len(red.get("issues", []))
+    scores["redirects"] = max(0, 100 - red_issues * 25)
+
+    # llms.txt score
+    llm = data["sections"].get("llms_txt", {})
+    if llm.get("exists"):
+        scores["llms_txt"] = llm.get("quality", {}).get("score", 0)
+    else:
+        scores["llms_txt"] = 0
+
+    # PageSpeed score
+    psi = data["sections"].get("pagespeed", {})
+    scores["pagespeed"] = psi.get("performance_score", 0)
+
+    # On-page score
+    op = data["sections"].get("onpage", {})
+    if op and not op.get("error"):
+        op_score = 50
+        if op.get("title"): op_score += 15
+        if op.get("meta_description"): op_score += 15
+        if op.get("h1"): op_score += 10
+        if op.get("canonical"): op_score += 10
+        scores["onpage"] = min(100, op_score)
+    else:
+        scores["onpage"] = 0
+
+    # Readability score
+    rd = data["sections"].get("readability", {})
+    flesch = rd.get("flesch_reading_ease", 0)
+    if flesch >= 60:
+        scores["readability"] = 100
+    elif flesch >= 30:
+        scores["readability"] = 50 + int((flesch - 30) * (50 / 30))
+    else:
+        scores["readability"] = max(0, int(flesch * (50 / 30)))
+
+    # Entity SEO score
+    ent = data["sections"].get("entity", {})
+    if ent and not ent.get("error"):
+        sameas = ent.get("sameas_analysis", {})
+        found = sameas.get("total_found", 0)
+        missing = sameas.get("total_missing_critical", 4)
+        has_wikidata = 1 if ent.get("wikidata", {}).get("found") else 0
+        has_wikipedia = 1 if ent.get("wikipedia", {}).get("found") else 0
+        ent_score = min(100, found * 15 + has_wikidata * 25 + has_wikipedia * 25)
+        issues_count = len(ent.get("issues", []))
+        ent_score = max(0, ent_score - issues_count * 10)
+        scores["entity"] = ent_score
+    else:
+        scores["entity"] = 0
+
+    # Link profile score
+    lp = data["sections"].get("link_profile", {})
+    if lp and not lp.get("error"):
+        avg_links = lp.get("avg_internal_links_per_page", 0)
+        orphans = lp.get("orphan_pages", {}).get("count", 0)
+        dead_ends = lp.get("dead_end_pages", {}).get("count", 0)
+        lp_score = 70
+        if avg_links >= 5: lp_score += 15
+        elif avg_links >= 3: lp_score += 5
+        else: lp_score -= 15
+        lp_score -= min(30, orphans * 5)
+        lp_score -= min(20, dead_ends * 3)
+        scores["link_profile"] = max(0, min(100, lp_score))
+    else:
+        scores["link_profile"] = 0
+
+    # Hreflang score (skip weight if not applicable)
+    hf = data["sections"].get("hreflang", {})
+    if hf and not hf.get("error"):
+        if hf.get("hreflang_tags_found", 0) > 0:
+            summary = hf.get("summary", {})
+            hf_score = 100 - summary.get("critical", 0) * 30 - summary.get("high", 0) * 15 - summary.get("medium", 0) * 5
+            scores["hreflang"] = max(0, min(100, hf_score))
+        else:
+            # No hreflang = single language site, skip from weighting
+            scores["hreflang"] = None
+    else:
+        scores["hreflang"] = None
+
+    # Duplicate content score
+    dc = data["sections"].get("duplicate_content", {})
+    if dc and not dc.get("error"):
+        dupes = len(dc.get("near_duplicates", []))
+        thin = len(dc.get("thin_pages", []))
+        dc_score = 100 - dupes * 20 - thin * 10
+        scores["duplicate_content"] = max(0, min(100, dc_score))
+    else:
+        scores["duplicate_content"] = 0
+
+    cq = data["sections"].get("content_quality", {})
+    if cq and not cq.get("error"):
+        scores["content_quality"] = int(cq.get("score", 0))
+    else:
+        scores["content_quality"] = 0
+
+    # Programmatic SEO score
+    pseo = data["sections"].get("programmatic_seo", {})
+    if pseo and not pseo.get("error") and pseo.get("pattern_groups_found", 0) > 0:
+        pseo_crit = pseo.get("total_critical_issues", 0)
+        pseo_warn = pseo.get("total_warnings", 0)
+        pseo_score = 100 - pseo_crit * 25 - pseo_warn * 8
+        scores["programmatic_seo"] = max(0, min(100, pseo_score))
+    else:
+        scores["programmatic_seo"] = None
+
+    # JSON-LD validation (validate_schema.py --json)
+    sch = data["sections"].get("schema_validation", {})
+    if sch and not sch.get("error"):
+        scores["schema_validation"] = int(sch.get("score", 0))
+    else:
+        scores["schema_validation"] = 0
+
+    # Image alt coverage
+    img = data["sections"].get("image_seo", {})
+    if img and not img.get("error"):
+        scores["image_seo"] = int(img.get("score", 0))
+    else:
+        scores["image_seo"] = 0
+
+    # Sitemap discovery
+    sm = data["sections"].get("sitemap", {})
+    if sm and not sm.get("error"):
+        scores["sitemap"] = int(sm.get("score", 0))
+    else:
+        scores["sitemap"] = 0
+
+    # Canonical
+    can = data["sections"].get("canonical", {})
+    if can and not can.get("error"):
+        scores["canonical"] = int(can.get("score", 0))
+    else:
+        scores["canonical"] = 50
+
+    loc = data["sections"].get("local_signals", {})
+    if loc and not loc.get("error"):
+        if loc.get("likely_local_business"):
+            scores["local_signals"] = int(loc.get("score") or 0)
+        else:
+            scores["local_signals"] = None
+            weights["local_signals"] = 0
+    else:
+        scores["local_signals"] = None
+        weights["local_signals"] = 0
+
+    # IndexNow probe (no API key)
+    inx = data["sections"].get("indexnow_probe", {})
+    if inx and not inx.get("error"):
+        scores["indexnow_probe"] = int(inx.get("score", 50))
+    else:
+        scores["indexnow_probe"] = 0
+
+    # Weighted average (only scored categories)
+    total_weight = 0
+    weighted_sum = 0
+    for k, w in weights.items():
+        if k in scores:
+            val = scores.get(k)
+            if val is not None:
+                total_weight += w
+                weighted_sum += val * w
+    
+    overall = round(weighted_sum / total_weight) if total_weight else 0
+
+    # Coerce any None scores to 0 to prevent UI crashes
+    for k in list(scores.keys()):
+        if scores[k] is None:
+            scores[k] = 0
+
+    return {
+        "overall": overall,
+        "categories": scores,
+        "weights": weights,
+    }
+
+
+def render_recommendations(section_data: dict) -> str:
+    """Render recommendations from a section's JSON data."""
+    recs = section_data.get("recommendations", section_data.get("suggestions", []))
+    if isinstance(recs, dict):
+        items = [f"{k}: {v}" for k, v in recs.items()]
+    elif isinstance(recs, list):
+        items = recs
+    else:
+        items = []
+    # Also check opportunities from pagespeed
+    opps = section_data.get("opportunities", [])
+    if isinstance(opps, list):
+        items.extend(opps)
+
+    # Render structured issues (used by entity_checker, hreflang_checker, etc.)
+    issues = section_data.get("issues", [])
+    issues_html = ""
+    if isinstance(issues, list) and issues:
+        severity_map = {"critical": "critical", "high": "critical", "warning": "warning", "medium": "warning", "info": "info", "low": "info"}
+        for issue in issues[:15]:
+            if isinstance(issue, dict):
+                sev = severity_map.get(issue.get("severity", "info").lower(), "info")
+                badge = html_lib.escape(issue.get("severity", "INFO").upper(), quote=True)
+                finding = html_lib.escape(str(issue.get("finding", "")), quote=True)
+                fix = html_lib.escape(str(issue.get("fix", "")), quote=True)
+                meta = _render_issue_metadata(_recommendation_metadata(issue, "section"))
+                issues_html += (
+                    f'<div class="issue-item {sev}">'
+                    f'<span class="issue-badge">{badge}</span>'
+                    f'<div><strong>{finding}</strong>'
+                    f'{f"<br><span style=&quot;color:var(--text-muted)&quot;>Fix: {fix}</span>" if fix else ""}'
+                    f'{meta}</div></div>'
+                )
+            elif isinstance(issue, str):
+                items.append(issue)
+
+    html = ""
+    if issues_html:
+        html += f'<div style="margin-top:16px"><h3 style="font-size:0.95rem;margin-bottom:8px;">🔍 Issues Found</h3>{issues_html}</div>'
+    if items:
+        html += '<div style="margin-top:16px"><h3 style="font-size:0.95rem;margin-bottom:8px;">💡 Recommendations</h3>'
+        for item in items[:15]:
+            item_str = str(item) if not isinstance(item, str) else item
+            html += f'<div class="issue-item info"><span class="issue-badge">FIX</span> {item_str}</div>'
+        html += '</div>'
+    return html
+
+
+def render_readability_rewrites(readability_data: dict) -> str:
+    """Render concrete sentence replacements for readability fixes."""
+    rewrites = readability_data.get("sentence_rewrites", [])
+    if not rewrites:
+        return ""
+
+    html = (
+        '<div style="margin-top:16px">'
+        '<h3 style="font-size:0.95rem;margin-bottom:8px;">✍️ What To Replace (Before/After)</h3>'
+    )
+    for item in rewrites[:5]:
+        current = html_lib.escape(str(item.get("current", "")), quote=True)
+        suggested = html_lib.escape(str(item.get("suggested", "")), quote=True)
+        wc_raw = item.get("current_word_count", "")
+        wc_label = f"{wc_raw}w" if isinstance(wc_raw, (int, float)) else str(wc_raw)
+        wc = html_lib.escape(wc_label, quote=True)
+        html += (
+            '<div class="issue-item warning">'
+            f'<span class="issue-badge">SENTENCE ({wc})</span>'
+            '<div>'
+            f'<div><strong>Current:</strong> {current}</div>'
+            f'<div style="margin-top:6px;"><strong>Replace with:</strong> {suggested}</div>'
+            '</div>'
+            '</div>'
+        )
+    html += "</div>"
+    return html
+
+
+def render_all_recommendations(data: dict) -> str:
+    """Render all recommendations from all sections."""
+    section_names = {
+        "security": "🔒 Security", "social": "📱 Social Meta", "robots": "🤖 Robots",
+        "broken_links": "🔗 Links", "internal_links": "🕸️ Internal Links",
+        "redirects": "↪️ Redirects", "llms_txt": "🧠 AI Search",
+        "pagespeed": "⚡ Performance", "onpage": "📝 On-Page", "readability": "📖 Readability",
+        "article": "📄 Article SEO", "entity": "🏛️ Entity SEO",
+        "link_profile": "🔗 Link Profile", "hreflang": "🌍 Hreflang",
+        "duplicate_content": "📋 Content Uniqueness",
+        "content_quality": "🧪 Content Quality",
+        "programmatic_seo": "🏭 Programmatic SEO",
+        "canonical": "🔗 Canonical Tags",
+        "schema_validation": "🧩 JSON-LD",
+        "image_seo": "🖼️ Image SEO",
+        "sitemap": "🗺️ Sitemaps",
+        "local_signals": "📍 Local signals",
+        "indexnow_probe": "📡 IndexNow",
+    }
+    html = ""
+    env_fixes = data.get("environment_fixes", [])
+    if env_fixes:
+        html += '<h3 style="font-size:0.95rem;margin:16px 0 8px;">🛠️ Environment-Specific Fixes</h3>'
+        for item in env_fixes[:8]:
+            title = html_lib.escape(item.get("title", ""), quote=True)
+            fix = html_lib.escape(item.get("fix", ""), quote=True)
+            html += f'<div class="issue-item info"><span class="issue-badge">FIX</span> <strong>{title}</strong>: {fix}</div>'
+
+    for key, label in section_names.items():
+        section = data["sections"].get(key, {})
+        recs = section.get("recommendations", section.get("suggestions", []))
+        if isinstance(recs, dict):
+            items = [f"{k}: {v}" for k, v in recs.items()]
+        elif isinstance(recs, list):
+            items = recs
+        else:
+            items = []
+        opps = section.get("opportunities", [])
+        if isinstance(opps, list):
+            items.extend(opps)
+        if key == "readability":
+            for rw in section.get("sentence_rewrites", [])[:3]:
+                cur = html_lib.escape(str(rw.get("current", ""))[:180], quote=True)
+                sug = html_lib.escape(str(rw.get("suggested", ""))[:180], quote=True)
+                items.append(f"Rewrite: {cur} → {sug}")
+        if items:
+            html += f'<h3 style="font-size:0.95rem;margin:16px 0 8px;">{label}</h3>'
+            for item in items[:10]:
+                html += f'<div class="issue-item info"><span class="issue-badge">FIX</span> {item}</div>'
+    return html if html else '<p style="color:var(--green)">✅ No recommendations — everything looks good!</p>'
+
+
+def generate_html(data: dict, scores: dict) -> str:
+    """Generate the interactive HTML report."""
+    domain = data["domain"]
+    url = data["url"]
+    timestamp = data["timestamp"]
+    overall = scores["overall"]
+
+    # Determine overall grade
+    if overall >= 90:
+        grade, grade_color = "A+", "#22c55e"
+    elif overall >= 80:
+        grade, grade_color = "A", "#22c55e"
+    elif overall >= 70:
+        grade, grade_color = "B", "#eab308"
+    elif overall >= 60:
+        grade, grade_color = "C", "#f97316"
+    elif overall >= 50:
+        grade, grade_color = "D", "#ef4444"
+    else:
+        grade, grade_color = "F", "#dc2626"
+
+    # Collect all issues
+    all_issues = []
+    for section_name, section_data in data["sections"].items():
+        issues = section_data.get("issues", [])
+        for issue in issues:
+            if isinstance(issue, dict):
+                # Structured issue from entity_checker, hreflang_checker, etc.
+                sev_raw = issue.get("severity", "info").lower()
+                severity_map = {"critical": "critical", "high": "critical", "warning": "warning", "medium": "warning", "info": "info", "low": "info"}
+                severity = severity_map.get(sev_raw, "info")
+                text = f"{issue.get('finding', '')} — Fix: {issue.get('fix', '')}" if issue.get('fix') else issue.get('finding', str(issue))
+                meta = _recommendation_metadata(issue, section_name)
+                all_issues.append({"text": text, "severity": severity, "section": section_name, **meta})
+            elif isinstance(issue, str):
+                severity = "critical" if "🔴" in issue else "warning" if "⚠️" in issue else "info"
+                all_issues.append({"text": issue, "severity": severity, "section": section_name})
+
+    critical_count = sum(1 for i in all_issues if i["severity"] == "critical")
+    warning_count = sum(1 for i in all_issues if i["severity"] == "warning")
+    pass_count = sum(1 for i in all_issues if i["severity"] == "info")
+
+    # Section data extraction
+    sec = data["sections"].get("security", {})
+    soc = data["sections"].get("social", {})
+    rob = data["sections"].get("robots", {})
+    bl = data["sections"].get("broken_links", {})
+    il = data["sections"].get("internal_links", {})
+    red = data["sections"].get("redirects", {})
+    llm = data["sections"].get("llms_txt", {})
+    psi = data["sections"].get("pagespeed", {})
+    op = data["sections"].get("onpage", {})
+    rd = data["sections"].get("readability", {})
+    art = data["sections"].get("article", {})
+    ent = data["sections"].get("entity", {})
+    lp = data["sections"].get("link_profile", {})
+    hf = data["sections"].get("hreflang", {})
+    dc = data["sections"].get("duplicate_content", {})
+    cq = data["sections"].get("content_quality", {})
+    sch = data["sections"].get("schema_validation", {})
+    imgsec = data["sections"].get("image_seo", {})
+    smap = data["sections"].get("sitemap", {})
+    cansec = data["sections"].get("canonical", {})
+    lsig = data["sections"].get("local_signals", {})
+    inxp = data["sections"].get("indexnow_probe", {})
+    env = data.get("environment", {})
+    env_fixes = data.get("environment_fixes", [])
+
+    env_primary = html_lib.escape(env.get("primary", "Unknown"), quote=True)
+    env_runtime = html_lib.escape(env.get("runtime", "Unknown"), quote=True)
+    env_confidence = html_lib.escape(env.get("confidence", "low").upper(), quote=True)
+    env_alts = [html_lib.escape(x, quote=True) for x in env.get("alternatives", [])]
+    env_signals_html = "".join(
+        f'<li class="mono" style="margin:4px 0;">{html_lib.escape(sig, quote=True)}</li>'
+        for sig in env.get("signals", [])
+    ) or '<li style="color:var(--text-muted)">No strong platform markers found.</li>'
+    env_fixes_html = render_environment_fixes(env_fixes)
+
+    # Build issues HTML
+    issues_html = ""
+    for issue in sorted(all_issues, key=lambda x: {"critical": 0, "warning": 1, "info": 2}[x["severity"]]):
+        badge_class = issue["severity"]
+        text = html_lib.escape(str(issue["text"]), quote=True)
+        issues_html += (
+            f'<div class="issue-item {badge_class}"><span class="issue-badge">{badge_class.upper()}</span>'
+            f'<div>{text}{_render_issue_metadata(issue)}</div></div>\n'
+        )
+
+    # Build category cards
+    category_labels = {
+        "security": ("🔒", "Security Headers"),
+        "social": ("📱", "Social Meta"),
+        "robots": ("🤖", "Robots & Crawlers"),
+        "broken_links": ("🔗", "Broken Links"),
+        "internal_links": ("🕸️", "Internal Links"),
+        "redirects": ("↪️", "Redirects"),
+        "llms_txt": ("🧠", "AI Search (llms.txt)"),
+        "pagespeed": ("⚡", "Performance (CWV)"),
+        "onpage": ("📝", "On-Page SEO"),
+        "readability": ("📖", "Readability"),
+        "article": ("📄", "Article Extractor"),
+        "entity": ("🏛️", "Entity SEO"),
+        "link_profile": ("🔗", "Link Profile"),
+        "hreflang": ("🌍", "Hreflang"),
+        "duplicate_content": ("📋", "Content Uniqueness"),
+        "content_quality": ("🧪", "Content Quality"),
+        "programmatic_seo": ("🏭", "Programmatic SEO"),
+        "canonical": ("🔗", "Canonical Tags"),
+        "schema_validation": ("🧩", "JSON-LD"),
+        "image_seo": ("🖼️", "Image SEO"),
+        "sitemap": ("🗺️", "Sitemaps"),
+        "local_signals": ("📍", "Local signals"),
+        "indexnow_probe": ("📡", "IndexNow"),
+    }
+
+    category_cards = ""
+    for key, (icon, label) in category_labels.items():
+        score = scores["categories"].get(key, 0)
+        if score is None:
+            score = 0
+        if score >= 80:
+            ring_color = "#22c55e"
+        elif score >= 50:
+            ring_color = "#eab308"
+        else:
+            ring_color = "#ef4444"
+        dash = round(score * 2.51327, 1)  # circumference = 251.327
+        category_cards += f'''
+        <div class="category-card" onclick="scrollToSection('{key}')">
+            <svg class="ring" viewBox="0 0 90 90">
+                <circle cx="45" cy="45" r="40" fill="none" stroke="var(--card-border)" stroke-width="6"/>
+                <circle cx="45" cy="45" r="40" fill="none" stroke="{ring_color}" stroke-width="6"
+                    stroke-dasharray="{dash} 251.327" stroke-linecap="round"
+                    transform="rotate(-90 45 45)" class="ring-progress"/>
+            </svg>
+            <div class="ring-label">{score}</div>
+            <div class="category-icon">{icon}</div>
+            <div class="category-name">{label}</div>
+        </div>'''
+
+    # Security details
+    security_rows = ""
+    for header, value in sec.get("headers_present", {}).items():
+        security_rows += f'<tr><td>{header}</td><td><span class="badge pass">Present</span></td><td class="mono">{value[:60]}</td></tr>'
+    for header, desc in sec.get("headers_missing", {}).items():
+        security_rows += f'<tr><td>{header}</td><td><span class="badge critical">Missing</span></td><td>{desc}</td></tr>'
+
+    # Social meta details
+    social_rows = ""
+    og = soc.get("og_tags", {})
+    tw = soc.get("twitter_tags", {})
+    for tag in ["og:title", "og:description", "og:image", "og:url", "og:type", "og:site_name"]:
+        val = og.get(tag, "")
+        status = '<span class="badge pass">✅</span>' if val else '<span class="badge critical">Missing</span>'
+        social_rows += f'<tr><td>{tag}</td><td>{status}</td><td>{val[:60] if val else "—"}</td></tr>'
+    for tag in ["twitter:card", "twitter:title", "twitter:description", "twitter:image", "twitter:site"]:
+        val = tw.get(tag, "")
+        status = '<span class="badge pass">✅</span>' if val else '<span class="badge warning">Missing</span>'
+        social_rows += f'<tr><td>{tag}</td><td>{status}</td><td>{val[:60] if val else "—"}</td></tr>'
+
+    # AI Crawlers details
+    ai_rows = ""
+    for crawler, status in rob.get("ai_crawler_status", {}).items():
+        if "blocked" in status:
+            badge = '<span class="badge pass">Blocked</span>'
+        elif "not managed" in status:
+            badge = '<span class="badge warning">Unmanaged</span>'
+        else:
+            badge = '<span class="badge info">Info</span>'
+        ai_rows += f'<tr><td>{crawler}</td><td>{badge}</td><td>{status}</td></tr>'
+
+    # Broken links details
+    broken_rows = ""
+    for link in bl.get("broken", [])[:20]:
+        status = link.get("status") or link.get("error", "?")
+        loc = "Internal" if link.get("is_internal") else "External"
+        broken_rows += f'<tr><td><span class="badge {"critical" if link.get("is_internal") else "warning"}">{loc}</span></td><td class="mono">{status}</td><td class="link-url">{link["url"][:80]}</td><td>{link.get("anchor_text", "")[:40]}</td></tr>'
+
+    bl_summary = bl.get("summary", {})
+    bl_total = bl_summary.get("total", 0)
+    bl_healthy = bl_summary.get("healthy", 0)
+    bl_broken = bl_summary.get("broken", 0)
+
+    # Internal links details
+    orphan_rows = ""
+    for orphan in il.get("orphan_candidates", [])[:15]:
+        orphan_rows += f'<tr><td class="link-url">{orphan["url"][:80]}</td><td>{orphan["incoming_links"]}</td></tr>'
+
+    il_pages = il.get("pages_crawled", 0)
+    il_total = il.get("total_internal_links", 0)
+    il_dist = il.get("link_distribution", {})
+
+    # Redirect details
+    redirect_rows = ""
+    for hop in red.get("chain", []):
+        status = hop.get("status", "?")
+        time_ms = hop.get("time_ms", 0)
+        if hop.get("final"):
+            icon_c = "pass" if 200 <= status < 300 else "critical"
+            redirect_rows += f'<tr><td>{hop["step"]}</td><td><span class="badge {icon_c}">{status}</span></td><td class="link-url">{hop["url"][:80]}</td><td>{time_ms}ms</td><td>FINAL</td></tr>'
+        else:
+            redirect_rows += f'<tr><td>{hop["step"]}</td><td><span class="badge warning">{status}</span></td><td class="link-url">{hop["url"][:80]}</td><td>{time_ms}ms</td><td>{hop.get("redirect_type", "")}</td></tr>'
+
+    # Anchor text chart data
+    anchor_data = il.get("anchor_texts", {})
+    anchor_items = list(anchor_data.items())[:10]
+    anchor_bars = ""
+    if anchor_items:
+        max_val = max(v for _, v in anchor_items) if anchor_items else 1
+        for text, count in anchor_items:
+            pct = round(count / max_val * 100)
+            anchor_bars += f'<div class="bar-row"><span class="bar-label">{text[:25]}</span><div class="bar-track"><div class="bar-fill" style="width:{pct}%"></div></div><span class="bar-value">{count}</span></div>'
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SEO Report — {domain}</title>
+<style>
+:root {{
+    --bg: #0f172a;
+    --surface: #1e293b;
+    --card: #1e293b;
+    --card-border: #334155;
+    --text: #f1f5f9;
+    --text-muted: #94a3b8;
+    --accent: #6366f1;
+    --accent-glow: rgba(99, 102, 241, 0.3);
+    --green: #22c55e;
+    --yellow: #eab308;
+    --red: #ef4444;
+    --orange: #f97316;
+    --radius: 12px;
+}}
+[data-theme="light"] {{
+    --bg: #f8fafc;
+    --surface: #ffffff;
+    --card: #ffffff;
+    --card-border: #e2e8f0;
+    --text: #1e293b;
+    --text-muted: #64748b;
+    --accent-glow: rgba(99, 102, 241, 0.15);
+}}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    min-height: 100vh;
+}}
+.container {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
+
+/* Header */
+.header {{
+    background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4338ca 100%);
+    padding: 48px 0 60px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+}}
+.header::before {{
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: radial-gradient(ellipse at center, rgba(99,102,241,0.15) 0%, transparent 70%);
+    animation: pulse 4s ease-in-out infinite;
+}}
+@keyframes pulse {{ 0%,100% {{ opacity: 0.5; }} 50% {{ opacity: 1; }} }}
+.header h1 {{ font-size: 2rem; font-weight: 700; color: white; position: relative; }}
+.header .domain {{ font-size: 1.1rem; color: #a5b4fc; margin-top: 8px; position: relative; }}
+.header .timestamp {{ font-size: 0.85rem; color: #818cf8; margin-top: 4px; position: relative; }}
+
+/* Theme Toggle */
+.theme-toggle {{
+    position: fixed; top: 16px; right: 16px; z-index: 100;
+    background: var(--surface); border: 1px solid var(--card-border);
+    border-radius: 50%; width: 44px; height: 44px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font-size: 1.2rem; transition: all 0.3s;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+}}
+.theme-toggle:hover {{ transform: scale(1.1); }}
+
+/* Overall Score */
+.score-hero {{
+    display: flex; justify-content: center; align-items: center;
+    gap: 48px; padding: 40px 0; flex-wrap: wrap;
+}}
+.score-gauge {{ position: relative; width: 180px; height: 180px; }}
+.score-gauge svg {{ width: 100%; height: 100%; }}
+.score-gauge .gauge-value {{
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    text-align: center;
+}}
+.score-gauge .gauge-number {{ font-size: 3rem; font-weight: 800; color: {grade_color}; }}
+.score-gauge .gauge-grade {{ font-size: 1rem; color: var(--text-muted); }}
+.score-stats {{ display: flex; gap: 24px; }}
+.stat-card {{
+    background: var(--card); border: 1px solid var(--card-border);
+    border-radius: var(--radius); padding: 20px 28px; text-align: center;
+    min-width: 100px;
+}}
+.stat-value {{ font-size: 2rem; font-weight: 700; }}
+.stat-label {{ font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }}
+.stat-critical .stat-value {{ color: var(--red); }}
+.stat-warning .stat-value {{ color: var(--yellow); }}
+.stat-pass .stat-value {{ color: var(--green); }}
+
+/* Category Cards Grid */
+.categories {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin: 32px 0; }}
+.category-card {{
+    background: var(--card); border: 1px solid var(--card-border);
+    border-radius: var(--radius); padding: 20px; text-align: center;
+    cursor: pointer; transition: all 0.3s;
+    position: relative;
+}}
+.category-card:hover {{ transform: translateY(-4px); box-shadow: 0 8px 24px var(--accent-glow); border-color: var(--accent); }}
+.category-card .ring {{ width: 70px; height: 70px; margin: 0 auto 8px; }}
+.category-card .ring-label {{
+    position: absolute; top: 52px; left: 50%; transform: translate(-50%, -50%);
+    font-size: 1.1rem; font-weight: 700;
+}}
+.ring-progress {{ transition: stroke-dasharray 1s ease; }}
+.category-icon {{ font-size: 1.3rem; margin: 4px 0; }}
+.category-name {{ font-size: 0.8rem; color: var(--text-muted); font-weight: 500; }}
+
+/* Sections */
+.section {{
+    background: var(--card); border: 1px solid var(--card-border);
+    border-radius: var(--radius); margin: 24px 0; overflow: hidden;
+}}
+.section-header {{
+    padding: 20px 24px; cursor: pointer; display: flex;
+    align-items: center; justify-content: space-between;
+    transition: background 0.2s;
+}}
+.section-header:hover {{ background: rgba(99,102,241,0.05); }}
+.section-header h2 {{ font-size: 1.15rem; font-weight: 600; display: flex; align-items: center; gap: 10px; }}
+.section-header .chevron {{ transition: transform 0.3s; font-size: 1.2rem; color: var(--text-muted); }}
+.section-header .chevron.open {{ transform: rotate(180deg); }}
+.section-body {{ padding: 0 24px 24px; display: none; }}
+.section-body.open {{ display: block; animation: fadeIn 0.3s; }}
+@keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(-8px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+
+/* Tables */
+table {{ width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.9rem; }}
+th {{ text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--card-border); color: var(--text-muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }}
+td {{ padding: 10px 12px; border-bottom: 1px solid var(--card-border); vertical-align: top; }}
+tr:last-child td {{ border-bottom: none; }}
+tr:hover td {{ background: rgba(99,102,241,0.03); }}
+.mono {{ font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.85rem; }}
+.link-url {{ word-break: break-all; max-width: 400px; color: var(--accent); }}
+
+/* Badges */
+.badge {{
+    display: inline-block; padding: 2px 10px; border-radius: 100px;
+    font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+}}
+.badge.critical {{ background: rgba(239,68,68,0.15); color: var(--red); }}
+.badge.warning {{ background: rgba(234,179,8,0.15); color: var(--yellow); }}
+.badge.pass {{ background: rgba(34,197,94,0.15); color: var(--green); }}
+.badge.info {{ background: rgba(99,102,241,0.15); color: var(--accent); }}
+
+/* Issues */
+.issue-item {{
+    padding: 12px 16px; border-radius: 8px; margin: 6px 0;
+    font-size: 0.9rem; display: flex; align-items: flex-start; gap: 10px;
+}}
+.issue-item.critical {{ background: rgba(239,68,68,0.08); border-left: 3px solid var(--red); }}
+.issue-item.warning {{ background: rgba(234,179,8,0.08); border-left: 3px solid var(--yellow); }}
+.issue-item.info {{ background: rgba(99,102,241,0.08); border-left: 3px solid var(--accent); }}
+.issue-badge {{ flex-shrink: 0; }}
+
+/* Bar Chart */
+.bar-row {{ display: flex; align-items: center; gap: 10px; margin: 6px 0; }}
+.bar-label {{ width: 150px; font-size: 0.85rem; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }}
+.bar-track {{ flex: 1; height: 22px; background: var(--card-border); border-radius: 4px; overflow: hidden; }}
+.bar-fill {{ height: 100%; background: linear-gradient(90deg, var(--accent), #818cf8); border-radius: 4px; transition: width 1s ease; }}
+.bar-value {{ width: 30px; font-size: 0.85rem; font-weight: 600; }}
+
+/* Summary cards row */
+.summary-row {{ display: flex; gap: 16px; margin: 16px 0; flex-wrap: wrap; }}
+.summary-item {{
+    flex: 1; min-width: 120px; background: var(--bg); border-radius: 8px;
+    padding: 16px; text-align: center;
+}}
+.summary-item .val {{ font-size: 1.5rem; font-weight: 700; }}
+.summary-item .lbl {{ font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }}
+
+/* Footer */
+.footer {{ text-align: center; padding: 32px 0; color: var(--text-muted); font-size: 0.8rem; }}
+
+@media (max-width: 768px) {{
+    .score-hero {{ flex-direction: column; gap: 24px; }}
+    .score-stats {{ flex-wrap: wrap; justify-content: center; }}
+    .categories {{ grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }}
+    .container {{ padding: 16px; }}
+}}
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<div class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">🌙</div>
+
+<div class="header">
+    <div class="container">
+        <h1>SEO Analysis Report</h1>
+        <div class="domain">{domain}</div>
+        <div class="timestamp">Generated: {datetime.fromisoformat(timestamp).strftime("%B %d, %Y at %I:%M %p")}</div>
+    </div>
+</div>
+
+<div class="container">
+
+    <!-- Overall Score -->
+    <div class="score-hero">
+        <div class="score-gauge">
+            <svg viewBox="0 0 200 200">
+                <circle cx="100" cy="100" r="85" fill="none" stroke="var(--card-border)" stroke-width="12"/>
+                <circle cx="100" cy="100" r="85" fill="none" stroke="{grade_color}" stroke-width="12"
+                    stroke-dasharray="{round(overall * 5.341, 1)} 534.07" stroke-linecap="round"
+                    transform="rotate(-90 100 100)"/>
+            </svg>
+            <div class="gauge-value">
+                <div class="gauge-number">{overall}</div>
+                <div class="gauge-grade">Grade: {grade}</div>
+            </div>
+        </div>
+        <div class="score-stats">
+            <div class="stat-card stat-critical">
+                <div class="stat-value">{critical_count}</div>
+                <div class="stat-label">Critical</div>
+            </div>
+            <div class="stat-card stat-warning">
+                <div class="stat-value">{warning_count}</div>
+                <div class="stat-label">Warnings</div>
+            </div>
+            <div class="stat-card stat-pass">
+                <div class="stat-value">{pass_count}</div>
+                <div class="stat-label">Info</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Category Cards -->
+    <div class="categories">
+        {category_cards}
+    </div>
+
+    <!-- Environment Detection -->
+    <div class="section" id="section-environment">
+        <div class="section-header" onclick="toggleSection('environment')">
+            <h2>🧭 Environment Detection (LLM-Inferred)</h2>
+            <span class="chevron" id="chevron-environment">▼</span>
+        </div>
+        <div class="section-body" id="body-environment">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{env_primary}</div><div class="lbl">Primary Platform</div></div>
+                <div class="summary-item"><div class="val">{env_runtime}</div><div class="lbl">Runtime Type</div></div>
+                <div class="summary-item"><div class="val">{env_confidence}</div><div class="lbl">Confidence</div></div>
+                <div class="summary-item"><div class="val">{len(env.get("signals", []))}</div><div class="lbl">Matched Signals</div></div>
+            </div>
+            <h3 style="margin: 16px 0 8px; font-size: 0.95rem;">Detection Signals</h3>
+            <ul style="padding-left:20px;">{env_signals_html}</ul>
+            {f'<p style="margin-top:10px;color:var(--text-muted)"><strong>Alternative matches:</strong> {", ".join(env_alts)}</p>' if env_alts else ''}
+        </div>
+    </div>
+
+    <!-- Environment-specific Fix Plan -->
+    <div class="section" id="section-env_fixes">
+        <div class="section-header" onclick="toggleSection('env_fixes')">
+            <h2>🛠️ Environment-Specific Fix Plan</h2>
+            <span class="chevron" id="chevron-env_fixes">▼</span>
+        </div>
+        <div class="section-body" id="body-env_fixes">
+            {env_fixes_html}
+        </div>
+    </div>
+
+    <!-- Issues Summary -->
+    <div class="section" id="section-issues">
+        <div class="section-header" onclick="toggleSection('issues')">
+            <h2>🚨 All Issues ({len(all_issues)})</h2>
+            <span class="chevron" id="chevron-issues">▼</span>
+        </div>
+        <div class="section-body" id="body-issues">
+            {issues_html if issues_html else '<p style="color:var(--text-muted)">No issues found — excellent!</p>'}
+        </div>
+    </div>
+
+    <!-- Security Headers -->
+    <div class="section" id="section-security">
+        <div class="section-header" onclick="toggleSection('security')">
+            <h2>🔒 Security Headers <span class="badge {"pass" if scores["categories"].get("security",0) >= 80 else "warning" if scores["categories"].get("security",0) >= 50 else "critical"}">{scores["categories"].get("security",0)}/100</span></h2>
+            <span class="chevron" id="chevron-security">▼</span>
+        </div>
+        <div class="section-body" id="body-security">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{"✅" if sec.get("https") else "❌"}</div><div class="lbl">HTTPS</div></div>
+                <div class="summary-item"><div class="val">{len(sec.get("headers_present", {}))}</div><div class="lbl">Present</div></div>
+                <div class="summary-item"><div class="val">{len(sec.get("headers_missing", {}))}</div><div class="lbl">Missing</div></div>
+            </div>
+            <table>
+                <thead><tr><th>Header</th><th>Status</th><th>Value / Description</th></tr></thead>
+                <tbody>{security_rows}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Social Meta -->
+    <div class="section" id="section-social">
+        <div class="section-header" onclick="toggleSection('social')">
+            <h2>📱 Social Meta Tags <span class="badge {"pass" if scores["categories"].get("social",0) >= 80 else "warning" if scores["categories"].get("social",0) >= 50 else "critical"}">{scores["categories"].get("social",0)}/100</span></h2>
+            <span class="chevron" id="chevron-social">▼</span>
+        </div>
+        <div class="section-body" id="body-social">
+            <table>
+                <thead><tr><th>Tag</th><th>Status</th><th>Value</th></tr></thead>
+                <tbody>{social_rows}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- AI Crawlers -->
+    <div class="section" id="section-robots">
+        <div class="section-header" onclick="toggleSection('robots')">
+            <h2>🤖 Robots & AI Crawlers <span class="badge {"pass" if scores["categories"].get("robots",0) >= 80 else "warning" if scores["categories"].get("robots",0) >= 50 else "critical"}">{scores["categories"].get("robots",0)}/100</span></h2>
+            <span class="chevron" id="chevron-robots">▼</span>
+        </div>
+        <div class="section-body" id="body-robots">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{rob.get("status", "?")}</div><div class="lbl">robots.txt</div></div>
+                <div class="summary-item"><div class="val">{len(rob.get("sitemaps", []))}</div><div class="lbl">Sitemaps</div></div>
+                <div class="summary-item"><div class="val">{len(rob.get("user_agents", {}))}</div><div class="lbl">User-Agents</div></div>
+            </div>
+            <h3 style="margin: 16px 0 8px; font-size: 0.95rem;">AI Crawler Management</h3>
+            <table>
+                <thead><tr><th>Crawler</th><th>Status</th><th>Details</th></tr></thead>
+                <tbody>{ai_rows}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Broken Links -->
+    <div class="section" id="section-broken_links">
+        <div class="section-header" onclick="toggleSection('broken_links')">
+            <h2>🔗 Broken Links <span class="badge {"pass" if bl_broken == 0 and bl_summary.get("soft_404s", 0) == 0 else "critical" if bl_broken > 0 else "warning"}">{bl_broken} broken{f" / {bl_summary.get('soft_404s', 0)} soft 404" if bl_summary.get('soft_404s', 0) > 0 else ""} / {bl_total} total</span></h2>
+            <span class="chevron" id="chevron-broken_links">▼</span>
+        </div>
+        <div class="section-body" id="body-broken_links">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val" style="color:var(--green)">{bl_healthy}</div><div class="lbl">Healthy</div></div>
+                <div class="summary-item"><div class="val" style="color:var(--red)">{bl_broken}</div><div class="lbl">Broken</div></div>
+                <div class="summary-item"><div class="val" style="color:var(--orange)">{bl_summary.get("soft_404s", 0)}</div><div class="lbl">Soft 404s</div></div>
+                <div class="summary-item"><div class="val" style="color:var(--yellow)">{bl_summary.get("redirected", 0)}</div><div class="lbl">Redirected</div></div>
+                <div class="summary-item"><div class="val" style="color:var(--orange)">{bl_summary.get("timeout", 0)}</div><div class="lbl">Timeout</div></div>
+            </div>
+            {"<table><thead><tr><th>Type</th><th>Status</th><th>URL</th><th>Anchor</th></tr></thead><tbody>" + broken_rows + "</tbody></table>" if broken_rows else '<p style="color:var(--green);margin-top:12px">✅ No broken links found</p>'}
+        </div>
+    </div>
+
+    <!-- Internal Links -->
+    <div class="section" id="section-internal_links">
+        <div class="section-header" onclick="toggleSection('internal_links')">
+            <h2>🕸️ Internal Link Structure <span class="badge {"pass" if scores["categories"].get("internal_links",0) >= 80 else "warning" if scores["categories"].get("internal_links",0) >= 50 else "critical"}">{scores["categories"].get("internal_links",0)}/100</span></h2>
+            <span class="chevron" id="chevron-internal_links">▼</span>
+        </div>
+        <div class="section-body" id="body-internal_links">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{il_pages}</div><div class="lbl">Pages Crawled</div></div>
+                <div class="summary-item"><div class="val">{il_total}</div><div class="lbl">Internal Links</div></div>
+                <div class="summary-item"><div class="val">{il_dist.get("avg", 0)}</div><div class="lbl">Avg Links/Page</div></div>
+                <div class="summary-item"><div class="val">{len(il.get("orphan_candidates", []))}</div><div class="lbl">Orphan Pages</div></div>
+            </div>
+            {f'<h3 style="margin:16px 0 8px;font-size:0.95rem;">Top Anchor Texts</h3>' + anchor_bars if anchor_bars else ''}
+            {f'<h3 style="margin:16px 0 8px;font-size:0.95rem;">Potential Orphan Pages</h3><table><thead><tr><th>URL</th><th>Incoming Links</th></tr></thead><tbody>{orphan_rows}</tbody></table>' if orphan_rows else ''}
+        </div>
+    </div>
+
+    <!-- Redirects -->
+    <div class="section" id="section-redirects">
+        <div class="section-header" onclick="toggleSection('redirects')">
+            <h2>↪️ Redirect Chain <span class="badge {"pass" if red.get("total_hops", 0) <= 1 else "warning"}">{red.get("total_hops", 0)} hops</span></h2>
+            <span class="chevron" id="chevron-redirects">▼</span>
+        </div>
+        <div class="section-body" id="body-redirects">
+            {f'<table><thead><tr><th>#</th><th>Status</th><th>URL</th><th>Time</th><th>Type</th></tr></thead><tbody>{redirect_rows}</tbody></table>' if redirect_rows else '<p style="color:var(--green)">✅ No redirects — direct access</p>'}
+        </div>
+    </div>
+
+    <!-- llms.txt -->
+    <div class="section" id="section-llms_txt">
+        <div class="section-header" onclick="toggleSection('llms_txt')">
+            <h2>🧠 AI Search Readiness (llms.txt) <span class="badge {"pass" if llm.get("exists") else "critical"}">{"Found" if llm.get("exists") else "Not Found"}</span></h2>
+            <span class="chevron" id="chevron-llms_txt">▼</span>
+        </div>
+        <div class="section-body" id="body-llms_txt">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{"✅" if llm.get("exists") else "❌"}</div><div class="lbl">llms.txt</div></div>
+                <div class="summary-item"><div class="val">{"✅" if llm.get("full_exists") else "❌"}</div><div class="lbl">llms-full.txt</div></div>
+                <div class="summary-item"><div class="val">{llm.get("quality", {}).get("score", 0)}</div><div class="lbl">Quality Score</div></div>
+            </div>
+            {"".join(f'<div class="issue-item warning"><span class="issue-badge">TIP</span> {s}</div>' for s in llm.get("quality", {}).get("suggestions", []))}
+        </div>
+    </div>
+
+    <!-- PageSpeed / Core Web Vitals -->
+    <div class="section" id="section-pagespeed">
+        <div class="section-header" onclick="toggleSection('pagespeed')">
+            <h2>⚡ Performance & Core Web Vitals <span class="badge {"pass" if scores["categories"].get("pagespeed",0) >= 80 else "warning" if scores["categories"].get("pagespeed",0) >= 50 else "critical"}">{scores["categories"].get("pagespeed",0)}/100</span></h2>
+            <span class="chevron" id="chevron-pagespeed">▼</span>
+        </div>
+        <div class="section-body" id="body-pagespeed">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{psi.get("performance_score", "?")}</div><div class="lbl">Performance</div></div>
+                <div class="summary-item"><div class="val">{psi.get("field_data", psi.get("lab_data", {})).get("LCP", "?")}</div><div class="lbl">LCP</div></div>
+                <div class="summary-item"><div class="val">{psi.get("field_data", psi.get("lab_data", {})).get("INP", psi.get("field_data", psi.get("lab_data", {})).get("TBT", "?"))}</div><div class="lbl">INP/TBT</div></div>
+                <div class="summary-item"><div class="val">{psi.get("field_data", psi.get("lab_data", {})).get("CLS", "?")}</div><div class="lbl">CLS</div></div>
+            </div>
+            {'<div class="issue-item warning"><span class="issue-badge">NOTE</span> <div><strong>PageSpeed API returned an error or was rate-limited.</strong><br><span style="color:var(--text-muted)">Try running <code>python3 scripts/pagespeed.py URL --api-key YOUR_KEY</code> manually, or rerun the report later. The LLM can still analyze Core Web Vitals by reading the page directly.</span></div></div>' if psi.get('error') or psi.get('performance_score', 0) == 0 else ''}
+            {render_recommendations(psi)}
+        </div>
+    </div>
+
+    <!-- On-Page SEO -->
+    <div class="section" id="section-onpage">
+        <div class="section-header" onclick="toggleSection('onpage')">
+            <h2>📝 On-Page SEO <span class="badge {"pass" if scores["categories"].get("onpage",0) >= 80 else "warning" if scores["categories"].get("onpage",0) >= 50 else "critical"}">{scores["categories"].get("onpage",0)}/100</span></h2>
+            <span class="chevron" id="chevron-onpage">▼</span>
+        </div>
+        <div class="section-body" id="body-onpage">
+            {f'<div class="issue-item info"><span class="issue-badge">NOTE</span> <div><strong>Raw HTML snapshot</strong> — title, meta description, canonical, and H1 are read from the initial response body. On {html_lib.escape(env.get("primary") or "this stack", quote=True)} / JS-heavy sites, tags may be injected client-side; confirm in DevTools or Google Rich Results Test if this section disagrees with what you see in the browser.</div></div>' if _needs_raw_html_disclaimer(env) else ''}
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{'✅' if op.get('title') else '❌'}</div><div class="lbl">Title Tag</div></div>
+                <div class="summary-item"><div class="val">{'✅' if op.get('meta_description') else '❌'}</div><div class="lbl">Meta Desc</div></div>
+                <div class="summary-item"><div class="val">{'✅' if op.get('h1') else '❌'}</div><div class="lbl">H1</div></div>
+                <div class="summary-item"><div class="val">{'✅' if op.get('canonical') else '❌'}</div><div class="lbl">Canonical</div></div>
+            </div>
+            <table>
+                <thead><tr><th>Element</th><th>Value</th><th>Length</th></tr></thead>
+                <tbody>
+                    <tr><td>Title</td><td>{(op.get('title','') or '—')[:70]}</td><td>{len(op.get('title','') or '')}</td></tr>
+                    <tr><td>Meta Description</td><td>{(op.get('meta_description','') or '—')[:100]}</td><td>{len(op.get('meta_description','') or '')}{' <span style="color:var(--text-muted)">(og:description fallback)</span>' if op.get('meta_description_source') == 'og_fallback' else ''}</td></tr>
+                    <tr><td>H1</td><td>{(op.get('h1',[''])[0] if isinstance(op.get('h1'), list) and op.get('h1') else op.get('h1','') or '—')[:70]}</td><td>—</td></tr>
+                    <tr><td>Canonical</td><td class="link-url">{(op.get('canonical') or '—')[:80]}{' <span style="color:var(--text-muted)">(from canonical audit)</span>' if op.get('canonical_from_audit') else ''}</td><td>—</td></tr>
+                </tbody>
+            </table>
+            {render_recommendations(op)}
+        </div>
+    </div>
+
+    <!-- Readability -->
+    <div class="section" id="section-readability">
+        <div class="section-header" onclick="toggleSection('readability')">
+            <h2>📖 Readability <span class="badge {"pass" if scores["categories"].get("readability",0) >= 80 else "warning" if scores["categories"].get("readability",0) >= 50 else "critical"}">{scores["categories"].get("readability",0)}/100</span></h2>
+            <span class="chevron" id="chevron-readability">▼</span>
+        </div>
+        <div class="section-body" id="body-readability">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{rd.get('flesch_reading_ease', '?')}</div><div class="lbl">Flesch Score</div></div>
+                <div class="summary-item"><div class="val">{rd.get('flesch_kincaid_grade', '?')}</div><div class="lbl">Grade Level</div></div>
+                <div class="summary-item"><div class="val">{rd.get('word_count', '?')}</div><div class="lbl">Words</div></div>
+                <div class="summary-item"><div class="val">{rd.get('estimated_reading_time_min', '?')} min</div><div class="lbl">Read Time</div></div>
+            </div>
+            {render_recommendations(rd)}
+            {render_readability_rewrites(rd)}
+        </div>
+    </div>
+
+    <!-- Article SEO Extractor -->
+    <div class="section" id="section-article">
+        <div class="section-header" onclick="toggleSection('article')">
+            <h2>📄 Article Info & Keywords <span class="badge {"pass" if scores["categories"].get("article",0) >= 80 else "warning" if scores["categories"].get("article",0) >= 50 else "critical"}">{scores["categories"].get("article",0)}/100</span></h2>
+            <span class="chevron" id="chevron-article">▼</span>
+        </div>
+        <div class="section-body" id="body-article">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{art.get('word_count', '?')}</div><div class="lbl">Words</div></div>
+                <div class="summary-item"><div class="val">{len(art.get('headings', dict()).get('h2', []))}</div><div class="lbl">H2 Headings</div></div>
+                <div class="summary-item"><div class="val">{len(art.get('images', []))}</div><div class="lbl">Images</div></div>
+            </div>
+            <h3 style="margin: 16px 0 8px; font-size: 0.95rem;">Extracted Keywords</h3>
+            <table>
+                <thead><tr><th>Target Keyword</th><th>LSI / Related Keywords</th></tr></thead>
+                <tbody>
+                    <tr>
+                        <td style="font-weight: 600; color: var(--accent);">{art.get('target_keyword', '—')}</td>
+                        <td>{', '.join(art.get('lsi_keywords', [])) if art.get('lsi_keywords') else '—'}</td>
+                    </tr>
+                </tbody>
+            </table>
+            {render_recommendations(art)}
+        </div>
+    </div>
+
+    <!-- Entity SEO -->
+    <div class="section" id="section-entity">
+        <div class="section-header" onclick="toggleSection('entity')">
+            <h2>🏛️ Entity SEO <span class="badge {"pass" if scores["categories"].get("entity",0) >= 50 else "warning" if scores["categories"].get("entity",0) >= 20 else "critical"}">{scores["categories"].get("entity",0)}/100</span></h2>
+            <span class="chevron" id="chevron-entity">▼</span>
+        </div>
+        <div class="section-body" id="body-entity">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{'✅' if ent.get('wikidata', {}).get('found') else '❌'}</div><div class="lbl">Wikidata</div></div>
+                <div class="summary-item"><div class="val">{'✅' if ent.get('wikipedia', {}).get('found') else '❌'}</div><div class="lbl">Wikipedia</div></div>
+                <div class="summary-item"><div class="val">{ent.get('sameas_analysis', {}).get('total_found', 0)}</div><div class="lbl">sameAs Links</div></div>
+                <div class="summary-item"><div class="val">{len(ent.get('issues', []))}</div><div class="lbl">Issues</div></div>
+            </div>
+            {render_recommendations(ent)}
+        </div>
+    </div>
+
+    <!-- Link Profile -->
+    <div class="section" id="section-link_profile">
+        <div class="section-header" onclick="toggleSection('link_profile')">
+            <h2>🔗 Link Profile <span class="badge {"pass" if scores["categories"].get("link_profile",0) >= 70 else "warning" if scores["categories"].get("link_profile",0) >= 40 else "critical"}">{scores["categories"].get("link_profile",0)}/100</span></h2>
+            <span class="chevron" id="chevron-link_profile">▼</span>
+        </div>
+        <div class="section-body" id="body-link_profile">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{lp.get('pages_crawled', '?')}</div><div class="lbl">Pages Crawled</div></div>
+                <div class="summary-item"><div class="val">{lp.get('avg_internal_links_per_page', '?')}</div><div class="lbl">Avg Links/Page</div></div>
+                <div class="summary-item"><div class="val">{lp.get('orphan_pages', {}).get('count', 0)}</div><div class="lbl">Orphan Pages</div></div>
+                <div class="summary-item"><div class="val">{lp.get('dead_end_pages', {}).get('count', 0)}</div><div class="lbl">Dead Ends</div></div>
+            </div>
+            {render_recommendations(lp)}
+        </div>
+    </div>
+
+    <!-- Hreflang -->
+    <div class="section" id="section-hreflang">
+        <div class="section-header" onclick="toggleSection('hreflang')">
+            <h2>🌍 Hreflang / International SEO <span class="badge {"pass" if hf.get('hreflang_tags_found', 0) > 0 else "info"}">{hf.get('hreflang_tags_found', 0)} tags</span></h2>
+            <span class="chevron" id="chevron-hreflang">▼</span>
+        </div>
+        <div class="section-body" id="body-hreflang">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{hf.get('implementation_method', 'none')}</div><div class="lbl">Method</div></div>
+                <div class="summary-item"><div class="val">{hf.get('hreflang_tags_found', 0)}</div><div class="lbl">Tags Found</div></div>
+            </div>
+            {'<p style="color:var(--text-muted);margin-top:12px">No hreflang tags found — this is expected for single-language sites.</p>' if hf.get('hreflang_tags_found', 0) == 0 else render_recommendations(hf)}
+        </div>
+    </div>
+
+    <!-- Duplicate Content -->
+    <div class="section" id="section-duplicate_content">
+        <div class="section-header" onclick="toggleSection('duplicate_content')">
+            <h2>📋 Content Uniqueness <span class="badge {"pass" if len(dc.get('near_duplicates', [])) == 0 else "warning"}">{len(dc.get('near_duplicates', []))} dupes / {len(dc.get('thin_pages', []))} thin</span></h2>
+            <span class="chevron" id="chevron-duplicate_content">▼</span>
+        </div>
+        <div class="section-body" id="body-duplicate_content">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{dc.get('pages_analyzed', '?')}</div><div class="lbl">Pages Analyzed</div></div>
+                <div class="summary-item"><div class="val">{len(dc.get('near_duplicates', []))}</div><div class="lbl">Near Duplicates</div></div>
+                <div class="summary-item"><div class="val">{len(dc.get('thin_pages', []))}</div><div class="lbl">Thin Pages</div></div>
+            </div>
+            {render_recommendations(dc)}
+        </div>
+    </div>
+
+    <!-- Content Quality -->
+    <div class="section" id="section-content_quality">
+        <div class="section-header" onclick="toggleSection('content_quality')">
+            <h2>🧪 Content Quality <span class="badge {"pass" if scores["categories"].get("content_quality",0) >= 75 else "warning"}">{scores["categories"].get("content_quality",0)}/100</span></h2>
+            <span class="chevron" id="chevron-content_quality">▼</span>
+        </div>
+        <div class="section-body" id="body-content_quality">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{cq.get('word_count', '?')}</div><div class="lbl">Words</div></div>
+                <div class="summary-item"><div class="val">{len(cq.get('filler_phrases', []))}</div><div class="lbl">Filler Hits</div></div>
+                <div class="summary-item"><div class="val">{cq.get('citation_gap', 0)}</div><div class="lbl">Citation Gap</div></div>
+            </div>
+            {render_recommendations(cq)}
+        </div>
+    </div>
+
+    <!-- JSON-LD validation -->
+    <div class="section" id="section-schema_validation">
+        <div class="section-header" onclick="toggleSection('schema_validation')">
+            <h2>🧩 JSON-LD / Schema <span class="badge {"pass" if scores["categories"].get("schema_validation",0) >= 70 else "warning"}">{scores["categories"].get("schema_validation",0)}/100</span></h2>
+            <span class="chevron" id="chevron-schema_validation">▼</span>
+        </div>
+        <div class="section-body" id="body-schema_validation">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{sch.get("jsonld_blocks", 0) if sch and not sch.get("error") else "—"}</div><div class="lbl">Blocks</div></div>
+                <div class="summary-item"><div class="val">{sch.get("error_count", 0) if sch and not sch.get("error") else "—"}</div><div class="lbl">Issues</div></div>
+                <div class="summary-item"><div class="val">{sch.get("critical_count", 0) if sch and not sch.get("error") else "—"}</div><div class="lbl">Critical</div></div>
+            </div>
+            {f'<p style="color:var(--red)">{html_lib.escape(str(sch.get("error","")))}</p>' if sch.get("error") else ""}
+            {render_recommendations(sch) if sch and not sch.get("error") else ""}
+        </div>
+    </div>
+
+    <!-- Image SEO -->
+    <div class="section" id="section-image_seo">
+        <div class="section-header" onclick="toggleSection('image_seo')">
+            <h2>🖼️ Image SEO <span class="badge {"pass" if scores["categories"].get("image_seo",0) >= 70 else "warning"}">{scores["categories"].get("image_seo",0)}/100</span></h2>
+            <span class="chevron" id="chevron-image_seo">▼</span>
+        </div>
+        <div class="section-body" id="body-image_seo">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{imgsec.get("total_images", "—") if imgsec and not imgsec.get("error") else "—"}</div><div class="lbl">Images</div></div>
+                <div class="summary-item"><div class="val">{imgsec.get("missing_alt", "—") if imgsec and not imgsec.get("error") else "—"}</div><div class="lbl">Missing alt</div></div>
+                <div class="summary-item"><div class="val">{imgsec.get("missing_alt_pct", "—") if imgsec and not imgsec.get("error") else "—"}%</div><div class="lbl">Missing %</div></div>
+            </div>
+            {f'<p style="color:var(--red)">{html_lib.escape(str(imgsec.get("error","")))}</p>' if imgsec.get("error") else ""}
+            {render_recommendations(imgsec) if imgsec and not imgsec.get("error") else ""}
+        </div>
+    </div>
+
+    <!-- Sitemaps -->
+    <div class="section" id="section-sitemap">
+        <div class="section-header" onclick="toggleSection('sitemap')">
+            <h2>🗺️ Sitemaps <span class="badge {"pass" if scores["categories"].get("sitemap",0) >= 70 else "warning" if scores["categories"].get("sitemap",0) >= 40 else "critical"}">{scores["categories"].get("sitemap",0)}/100</span></h2>
+            <span class="chevron" id="chevron-sitemap">▼</span>
+        </div>
+        <div class="section-body" id="body-sitemap">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{len(smap.get("sitemap_urls", [])) if smap and not smap.get("error") else "—"}</div><div class="lbl">Sitemaps listed</div></div>
+                <div class="summary-item"><div class="val">{smap.get("primary_status", "—") if smap and not smap.get("error") else "—"}</div><div class="lbl">Primary HTTP</div></div>
+                <div class="summary-item"><div class="val">{smap.get("url_count_estimate", "—") if smap and not smap.get("error") else "—"}</div><div class="lbl">URLs (1st)</div></div>
+                <div class="summary-item"><div class="val" style="color:{'var(--green)' if len(smap.get('url_health', {}).get('not_found_404', [])) == 0 else 'var(--red)'}">{smap.get("url_health", {}).get("checked", "—")}</div><div class="lbl">URLs Checked</div></div>
+            </div>
+            {"<h3 style='margin:16px 0 8px;font-size:0.95rem;'>URL Health Check</h3><div class='summary-row'><div class='summary-item'><div class='val' style='color:var(--green)'>" + str(smap.get("url_health", {}).get("healthy", 0)) + "</div><div class='lbl'>Healthy</div></div><div class='summary-item'><div class='val' style='color:var(--red)'>" + str(len(smap.get("url_health", {}).get("not_found_404", []))) + "</div><div class='lbl'>404 Not Found</div></div><div class='summary-item'><div class='val' style='color:var(--orange)'>" + str(len(smap.get("url_health", {}).get("soft_404s", []))) + "</div><div class='lbl'>Soft 404s</div></div><div class='summary-item'><div class='val' style='color:var(--red)'>" + str(len(smap.get("url_health", {}).get("server_errors_5xx", []))) + "</div><div class='lbl'>5xx Errors</div></div></div>" if smap.get("url_health", {}).get("checked", 0) > 0 else ""}
+            {f'<p style="color:var(--red)">{html_lib.escape(str(smap.get("error","")))}</p>' if smap.get("error") else ""}
+            {render_recommendations(smap) if smap and not smap.get("error") else ""}
+        </div>
+    </div>
+
+    <!-- Canonical Tags -->
+    <div class="section" id="section-canonical">
+        <div class="section-header" onclick="toggleSection('canonical')">
+            <h2>🔗 Canonical Tags <span class="badge {"pass" if scores["categories"].get("canonical",0) >= 70 else "warning" if scores["categories"].get("canonical",0) >= 40 else "critical"}">{scores["categories"].get("canonical",0)}/100</span></h2>
+            <span class="chevron" id="chevron-canonical">▼</span>
+        </div>
+        <div class="section-body" id="body-canonical">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{'✅' if cansec.get('canonical') else '❌'}</div><div class="lbl">Canonical</div></div>
+                <div class="summary-item"><div class="val">{'✅' if cansec.get('is_self_referencing') else '❌' if cansec.get('is_self_referencing') is False else '—'}</div><div class="lbl">Self-Ref</div></div>
+                <div class="summary-item"><div class="val">{cansec.get('canonical_status', '—')}</div><div class="lbl">Target HTTP</div></div>
+                <div class="summary-item"><div class="val">{cansec.get('score', '—')}</div><div class="lbl">Score</div></div>
+            </div>
+            {f'<p style="color:var(--red)">{html_lib.escape(str(cansec.get("error","")))}</p>' if cansec.get("error") else ""}
+            {render_recommendations(cansec) if cansec and not cansec.get("error") else ""}
+        </div>
+    </div>
+
+    <!-- Local signals -->
+    <div class="section" id="section-local_signals">
+        <div class="section-header" onclick="toggleSection('local_signals')">
+            <h2>📍 Local signals <span class="badge {"pass" if scores["categories"].get("local_signals",0) >= 70 else "warning"}">{scores["categories"].get("local_signals",0)}/100</span></h2>
+            <span class="chevron" id="chevron-local_signals">▼</span>
+        </div>
+        <div class="section-body" id="body-local_signals">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{"Yes" if lsig.get("localbusiness_jsonld") else "No"}</div><div class="lbl">LocalBusiness</div></div>
+                <div class="summary-item"><div class="val">{lsig.get("tel_links", "—")}</div><div class="lbl">tel: links</div></div>
+                <div class="summary-item"><div class="val">{"Yes" if lsig.get("structured_address_signals") else "No"}</div><div class="lbl">Address JSON</div></div>
+            </div>
+            {f'<p style="color:var(--red)">{html_lib.escape(str(lsig.get("error","")))}</p>' if lsig.get("error") else ""}
+            {render_recommendations(lsig) if lsig and not lsig.get("error") else ""}
+        </div>
+    </div>
+
+    <!-- IndexNow probe -->
+    <div class="section" id="section-indexnow_probe">
+        <div class="section-header" onclick="toggleSection('indexnow_probe')">
+            <h2>📡 IndexNow (probe) <span class="badge info">{scores["categories"].get("indexnow_probe",0)}/100</span></h2>
+            <span class="chevron" id="chevron-indexnow_probe">▼</span>
+        </div>
+        <div class="section-body" id="body-indexnow_probe">
+            <div class="summary-row">
+                <div class="summary-item"><div class="val">{"Yes" if inxp.get("meta_indexnow_present") else "No"}</div><div class="lbl">Meta tag</div></div>
+                <div class="summary-item"><div class="val">{"Yes" if inxp.get("robots_mentions_indexnow") else "No"}</div><div class="lbl">robots hint</div></div>
+                <div class="summary-item"><div class="val">{"Yes" if inxp.get("robots_has_sitemap") else "No"}</div><div class="lbl">Sitemap in robots</div></div>
+            </div>
+            {f'<p style="color:var(--red)">{html_lib.escape(str(inxp.get("error","")))}</p>' if inxp.get("error") else ""}
+            {render_recommendations(inxp) if inxp and not inxp.get("error") else ""}
+        </div>
+    </div>
+
+    <!-- Recommendations Summary -->
+    <div class="section" id="section-recs">
+        <div class="section-header" onclick="toggleSection('recs')">
+            <h2>💡 All Recommendations</h2>
+            <span class="chevron" id="chevron-recs">▼</span>
+        </div>
+        <div class="section-body" id="body-recs">
+            {render_all_recommendations(data)}
+        </div>
+    </div>
+
+</div>
+
+<div class="footer">
+    <p>Generated by SEO Skill · {datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M")}</p>
+</div>
+
+<script>
+function toggleSection(id) {{
+    const body = document.getElementById('body-' + id);
+    const chevron = document.getElementById('chevron-' + id);
+    body.classList.toggle('open');
+    chevron.classList.toggle('open');
+}}
+function scrollToSection(id) {{
+    const el = document.getElementById('section-' + id);
+    if (el) {{
+        el.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+        // Auto-open
+        const body = document.getElementById('body-' + id);
+        const chevron = document.getElementById('chevron-' + id);
+        if (!body.classList.contains('open')) {{
+            body.classList.add('open');
+            chevron.classList.add('open');
+        }}
+    }}
+}}
+function toggleTheme() {{
+    const html = document.documentElement;
+    const btn = document.querySelector('.theme-toggle');
+    if (html.getAttribute('data-theme') === 'light') {{
+        html.removeAttribute('data-theme');
+        btn.textContent = '🌙';
+    }} else {{
+        html.setAttribute('data-theme', 'light');
+        btn.textContent = '☀️';
+    }}
+}}
+// Auto-open issues section
+document.getElementById('body-issues').classList.add('open');
+document.getElementById('chevron-issues').classList.add('open');
+</script>
+
+</body>
+</html>'''
+
+    return html
+
+
+def export_xlsx(data: dict, scores: dict, output_path: str) -> str:
+    """Export report data to an Excel workbook. Returns the output path."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    except ImportError:
+        print("⚠️  openpyxl not installed. Install with: pip install openpyxl>=3.1.0",
+              file=sys.stderr)
+        return ""
+
+    wb = Workbook()
+    header_font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border = Border(
+        bottom=Side(style="thin", color="D0D5DD"),
+    )
+
+    def _write_header(ws, headers: list):
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+    def _auto_width(ws):
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                val = str(cell.value or "")
+                max_len = max(max_len, min(len(val), 60))
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+
+    # --- Sheet 1: Summary ---
+    ws = wb.active
+    ws.title = "Summary"
+    _write_header(ws, ["Metric", "Value"])
+    summary_rows = [
+        ("URL", data.get("url", "")),
+        ("Domain", data.get("domain", "")),
+        ("Report Date", data.get("timestamp", "")),
+        ("Overall Score", f"{scores['overall']}/100"),
+        ("Platform Detected", data.get("environment", {}).get("primary", "Unknown")),
+        ("Runtime", data.get("environment", {}).get("runtime", "Unknown")),
+        ("", ""),
+        ("— Category Scores —", ""),
+    ]
+    category_labels = {
+        "security": "Security Headers", "social": "Social Meta",
+        "robots": "Robots & Crawlers", "broken_links": "Broken Links",
+        "internal_links": "Internal Links", "redirects": "Redirects",
+        "llms_txt": "AI Search (llms.txt)", "pagespeed": "Performance (CWV)",
+        "onpage": "On-Page SEO", "readability": "Readability",
+        "entity": "Entity SEO", "link_profile": "Link Profile",
+        "hreflang": "Hreflang", "duplicate_content": "Content Uniqueness",
+        "schema_validation": "JSON-LD", "image_seo": "Image SEO",
+        "sitemap": "Sitemaps", "canonical": "Canonical Tags",
+        "local_signals": "Local Signals", "indexnow_probe": "IndexNow",
+    }
+    for key, label in category_labels.items():
+        val = scores["categories"].get(key, 0)
+        weight = scores["weights"].get(key, 0)
+        summary_rows.append((label, f"{val}/100 (weight: {weight}%)"))
+
+    for r, (metric, value) in enumerate(summary_rows, 2):
+        ws.cell(row=r, column=1, value=metric).border = thin_border
+        ws.cell(row=r, column=2, value=str(value)).border = thin_border
+    _auto_width(ws)
+
+    # --- Sheet 2: Issues ---
+    ws2 = wb.create_sheet("Issues")
+    _write_header(ws2, ["Severity", "Section", "Finding", "Fix"])
+    row = 2
+    for section_name, section_data in data["sections"].items():
+        for issue in section_data.get("issues", []):
+            if isinstance(issue, dict):
+                ws2.cell(row=row, column=1, value=issue.get("severity", "info").upper()).border = thin_border
+                ws2.cell(row=row, column=2, value=section_name).border = thin_border
+                ws2.cell(row=row, column=3, value=issue.get("finding", "")).border = thin_border
+                ws2.cell(row=row, column=4, value=issue.get("fix", "")).border = thin_border
+                row += 1
+            elif isinstance(issue, str):
+                ws2.cell(row=row, column=1, value="INFO").border = thin_border
+                ws2.cell(row=row, column=2, value=section_name).border = thin_border
+                ws2.cell(row=row, column=3, value=issue).border = thin_border
+                row += 1
+    for fix_item in data.get("environment_fixes", []):
+        ws2.cell(row=row, column=1, value=fix_item.get("severity", "info").upper()).border = thin_border
+        ws2.cell(row=row, column=2, value="environment").border = thin_border
+        ws2.cell(row=row, column=3, value=fix_item.get("title", "")).border = thin_border
+        ws2.cell(row=row, column=4, value=fix_item.get("fix", "")).border = thin_border
+        row += 1
+    _auto_width(ws2)
+
+    # --- Sheet 3: Links ---
+    ws3 = wb.create_sheet("Links")
+    _write_header(ws3, ["Type", "Status", "URL", "Anchor Text", "Internal?"])
+    row = 2
+    bl = data["sections"].get("broken_links", {})
+    for link in bl.get("broken", []):
+        ws3.cell(row=row, column=1, value="Broken").border = thin_border
+        ws3.cell(row=row, column=2, value=str(link.get("status", link.get("error", "?")))).border = thin_border
+        ws3.cell(row=row, column=3, value=link.get("url", "")).border = thin_border
+        ws3.cell(row=row, column=4, value=link.get("anchor_text", "")).border = thin_border
+        ws3.cell(row=row, column=5, value="Yes" if link.get("is_internal") else "No").border = thin_border
+        row += 1
+    il = data["sections"].get("internal_links", {})
+    for orphan in il.get("orphan_candidates", []):
+        ws3.cell(row=row, column=1, value="Orphan").border = thin_border
+        ws3.cell(row=row, column=2, value="—").border = thin_border
+        ws3.cell(row=row, column=3, value=orphan.get("url", "")).border = thin_border
+        ws3.cell(row=row, column=4, value="—").border = thin_border
+        ws3.cell(row=row, column=5, value=str(orphan.get("incoming_links", 0))).border = thin_border
+        row += 1
+    _auto_width(ws3)
+
+    # --- Sheet 4: Technical ---
+    ws4 = wb.create_sheet("Technical")
+    _write_header(ws4, ["Check", "Status", "Detail"])
+    row = 2
+    sec = data["sections"].get("security", {})
+    for header, value in sec.get("headers_present", {}).items():
+        ws4.cell(row=row, column=1, value=header).border = thin_border
+        ws4.cell(row=row, column=2, value="Present").border = thin_border
+        ws4.cell(row=row, column=3, value=str(value)[:200]).border = thin_border
+        row += 1
+    for header, desc in sec.get("headers_missing", {}).items():
+        ws4.cell(row=row, column=1, value=header).border = thin_border
+        ws4.cell(row=row, column=2, value="Missing").border = thin_border
+        ws4.cell(row=row, column=3, value=desc).border = thin_border
+        row += 1
+    rob = data["sections"].get("robots", {})
+    for crawler, status in rob.get("ai_crawler_status", {}).items():
+        ws4.cell(row=row, column=1, value=f"AI Crawler: {crawler}").border = thin_border
+        ws4.cell(row=row, column=2, value="Blocked" if "blocked" in status else "Managed" if "not managed" not in status else "Unmanaged").border = thin_border
+        ws4.cell(row=row, column=3, value=status).border = thin_border
+        row += 1
+    psi = data["sections"].get("pagespeed", {})
+    if psi and not psi.get("error"):
+        for metric in ["LCP", "INP", "CLS", "TBT", "FCP", "SI"]:
+            val = psi.get("field_data", psi.get("lab_data", {})).get(metric)
+            if val is not None:
+                ws4.cell(row=row, column=1, value=f"CWV: {metric}").border = thin_border
+                ws4.cell(row=row, column=2, value="Measured").border = thin_border
+                ws4.cell(row=row, column=3, value=str(val)).border = thin_border
+                row += 1
+    _auto_width(ws4)
+
+    if not output_path.endswith(".xlsx"):
+        output_path += ".xlsx"
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
+def export_pdf(html: str, output_path: str) -> Optional[str]:
+    """Render HTML report to PDF using WeasyPrint (optional dependency)."""
+    try:
+        from weasyprint import HTML
+    except ImportError:
+        print(
+            "\n❌ PDF export requires WeasyPrint:\n"
+            "     pip install weasyprint\n"
+            "   System libraries: https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation\n"
+            "   Or use --format html and Print → Save as PDF in your browser.\n",
+            file=sys.stderr,
+        )
+        return None
+
+    if not output_path.endswith(".pdf"):
+        output_path += ".pdf"
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    try:
+        HTML(string=html, base_url=os.getcwd()).write_pdf(output_path)
+    except Exception as e:
+        print(
+            f"\n❌ WeasyPrint could not build PDF ({e}).\n"
+            "   Try --format html and use the browser Print dialog → Save as PDF.\n",
+            file=sys.stderr,
+        )
+        return None
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate interactive SEO report (HTML/XLSX/PDF)")
+    parser.add_argument("url", help="Website URL to analyze")
+    parser.add_argument("--output", "-o", help="Output filename (default: seo-report-<domain>.<ext>)")
+    parser.add_argument(
+        "--format", "-f", dest="fmt", default="html",
+        choices=["html", "xlsx", "pdf", "all"],
+        help="Output format: html (default), xlsx (Excel), pdf (WeasyPrint), all (HTML + XLSX)",
+    )
+    parser.add_argument(
+        "--crawl-deep",
+        action="store_true",
+        help="Multi-page crawl for broken_links + canonical_checker (capped; slower, more server load)",
+    )
+    parser.add_argument(
+        "--crawl-max-pages",
+        type=int,
+        default=30,
+        metavar="N",
+        help="With --crawl-deep: max pages per crawl (default: 30)",
+    )
+    parser.add_argument(
+        "--crawl-depth",
+        type=int,
+        default=2,
+        metavar="D",
+        help="With --crawl-deep: BFS depth (default: 2)",
+    )
+    parser.add_argument(
+        "--render",
+        choices=["never", "auto", "always"],
+        default="never",
+        help="Render the main page HTML with Playwright before page-level checks",
+    )
+
+    args = parser.parse_args()
+    domain = urlparse(args.url).netloc.replace(".", "_")
+
+    data = collect_data(
+        args.url,
+        crawl_deep=args.crawl_deep,
+        crawl_max_pages=max(1, args.crawl_max_pages),
+        crawl_depth=max(1, args.crawl_depth),
+        render=args.render,
+    )
+    scores = calculate_overall_score(data)
+
+    formats = ["html", "xlsx"] if args.fmt == "all" else [args.fmt]
+
+    html_cache = None
+    for fmt in formats:
+        if fmt == "html":
+            html_cache = generate_html(data, scores)
+            if args.output and args.fmt != "all":
+                out = args.output
+            elif args.output and args.fmt == "all":
+                out = f"{args.output}.html"
+            else:
+                out = f"seo-report-{domain}.html"
+            out_dir = os.path.dirname(out)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(html_cache)
+            print(f"\n✅ HTML report saved to: {os.path.abspath(out)}")
+
+        elif fmt == "xlsx":
+            if args.output and args.fmt != "all":
+                out = args.output
+            elif args.output and args.fmt == "all":
+                out = f"{args.output}.xlsx"
+            else:
+                out = f"seo-report-{domain}.xlsx"
+            result = export_xlsx(data, scores, out)
+            if result:
+                print(f"✅ Excel report saved to: {os.path.abspath(result)}")
+
+        elif fmt == "pdf":
+            if html_cache is None:
+                html_cache = generate_html(data, scores)
+            if args.output:
+                out = args.output
+            else:
+                out = f"seo-report-{domain}.pdf"
+            result = export_pdf(html_cache, out)
+            if result:
+                print(f"✅ PDF report saved to: {os.path.abspath(result)}")
+
+    print(f"   Overall Score: {scores['overall']}/100")
+
+
+if __name__ == "__main__":
+    main()

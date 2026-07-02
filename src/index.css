@@ -1,0 +1,86 @@
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  /* ---- PFL Project brand tokens (logo-derived) ---- */
+  --color-brand-primary: #E04A3B;    /* Signal Red — cap/label, CTAs, urgency (client-specified) */
+  --color-brand-secondary: #F2A93C;  /* Amber Gold — bottle body, accents */
+  --color-brand-tertiary: #577F38;   /* Leaf Green — ACCENT: wave, growth, success (client-specified) */
+  --color-brand-surface: #FAF7F0;    /* Warm off-white — page base */
+  --color-brand-surfaceAlt: #F3EEE2; /* Deeper cream — alt sections */
+  --color-brand-muted: #E4DDC9;      /* Soft borders on cream */
+  --color-brand-ink: #2B2620;        /* Warm near-black — dark bands/footer */
+
+  --color-text-base: #2B2620;
+  --color-text-soft: #6B6355;
+  --color-text-inverse: #FAF7F0;
+
+  --font-display: 'Fraunces', ui-serif, Georgia, serif;
+  --font-body: 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, monospace;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-body);
+  background-color: var(--color-brand-surface);
+  color: var(--color-text-base);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-brand-secondary) 45%, transparent);
+}
+
+/* Focus ring — brand primary, visible everywhere */
+:focus-visible {
+  outline: 2px solid var(--color-brand-primary);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/* Glass morphism recipe */
+.glass {
+  background: color-mix(in srgb, var(--color-brand-surface) 60%, transparent);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  box-shadow:
+    0 1px 2px rgba(43, 38, 32, 0.04),
+    0 8px 24px -8px rgba(43, 38, 32, 0.10),
+    0 24px 48px -16px rgba(43, 38, 32, 0.08);
+}
+
+.glass-dark {
+  background: rgba(250, 247, 240, 0.06);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(250, 247, 240, 0.12);
+  box-shadow: 0 24px 48px -16px rgba(0, 0, 0, 0.35);
+}
+
+/* Particle drift keyframes — plastic-fragments-to-leaves rising motif */
+@keyframes pfl-rise {
+  0%   { transform: translate3d(0, 0, 0) rotate(0deg); }
+  25%  { transform: translate3d(14px, -25vh, 0) rotate(45deg); }
+  50%  { transform: translate3d(-10px, -50vh, 0) rotate(90deg); }
+  75%  { transform: translate3d(12px, -75vh, 0) rotate(135deg); }
+  100% { transform: translate3d(0, -105vh, 0) rotate(180deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .pfl-particle { animation: none !important; opacity: 0.06 !important; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Hide scrollbar for horizontal chip rows */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }

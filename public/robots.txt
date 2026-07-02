@@ -1,0 +1,84 @@
+# robots.txt for PFL Project — Plastic-pollution Free Lagos Project
+# https://pflproject.com
+
+# ─── Sitemap ─────────────────────────────────────────────────────────────────────
+Sitemap: https://pflproject.com/sitemap.xml
+
+# ─── LLMs (AI Discovery) ──────────────────────────────────────────────────────────
+# This file helps AI assistants discover and cite the website.
+# https://llmstxt.org/
+Link: https://pflproject.com/llms.txt; rel="llms.txt"
+
+# ─── AI Search / Generative Engine Crawlers ────────────────────────────────────────
+# These directives help manage how AI search engines index the site (GEO optimization).
+
+# ChatGPT / OpenAI — allow full access (we want AI to cite us)
+User-agent: GPTBot
+Allow: /
+Allow: /lagos-and-plastics
+Allow: /partners
+Allow: /contact
+
+# OpenAI Search Bot — allow for AI-powered search results
+User-agent: OAI-SearchBot
+Allow: /
+Allow: /lagos-and-plastics
+Allow: /partners
+Allow: /contact
+
+# Google AI / Google Extended — allow for AI Overviews and Gemini
+User-agent: Google-Extended
+Allow: /
+
+# Perplexity Bot — allow for Perplexity AI citations
+User-agent: PerplexityBot
+Allow: /
+Allow: /lagos-and-plastics
+Allow: /partners
+Allow: /contact
+
+# Anthropic Claude — allow for Claude citations
+User-agent: ClaudeBot
+Allow: /
+Allow: /lagos-and-plastics
+Allow: /partners
+Allow: /contact
+
+# Bing Copilot / Bing AI — allow
+User-agent: BingPreview
+Allow: /
+User-agent: MicrosoftPreview
+Allow: /
+
+# ─── Standard Search Engine Crawlers ──────────────────────────────────────────────
+User-agent: Googlebot
+Allow: /
+Allow: /lagos-and-plastics
+Allow: /partners
+Allow: /contact
+
+User-agent: Bingbot
+Allow: /
+
+User-agent: Slurp  # Yahoo
+Allow: /
+
+User-agent: DuckDuckBot
+Allow: /
+
+User-agent: Baiduspider
+Allow: /
+
+User-agent: YandexBot
+Allow: /
+
+# ─── Disallowed paths ────────────────────────────────────────────────────────────
+User-agent: *
+Disallow: /404
+Disallow: /*?*
+Disallow: /*.json$
+Allow: /
+
+# ─── Crawl delay for polite crawling ─────────────────────────────────────────────
+User-agent: *
+Crawl-Delay: 10
