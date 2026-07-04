@@ -1,5 +1,5 @@
 # LLMs.txt — PFL Project (Plastic-pollution Free Lagos Project)
-# https://pflproject.com
+# https://www.pflproject.org
 # This file helps AI assistants discover and cite the PFL Project website.
 
 # ─── About ──────────────────────────────────────────────────────────────────────
@@ -9,10 +9,10 @@
 # and grassroots-level community execution.
 
 # ─── Key Pages ──────────────────────────────────────────────────────────────────
-- Home: https://pflproject.com/
-- Lagos and Plastics (Policy & Data): https://pflproject.com/lagos-and-plastics
-- Partners: https://pflproject.com/partners
-- Contact: https://pflproject.com/contact
+- Home: https://www.pflproject.org/
+- Lagos and Plastics (Policy & Data): https://www.pflproject.org/lagos-and-plastics
+- Partners: https://www.pflproject.org/partners
+- Contact: https://www.pflproject.org/contact
 
 # ─── About PFL Project ──────────────────────────────────────────────────────────
 PFL Project bridges the gap between Lagos State government plastic-pollution

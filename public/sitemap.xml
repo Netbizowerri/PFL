@@ -4,7 +4,7 @@
         xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"
         xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">
   <url>
-    <loc>https://pflproject.com/</loc>
+    <loc>https://www.pflproject.org/</loc>
     <lastmod>2026-07-02</lastmod>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
@@ -14,24 +14,24 @@
       <image:caption>PFL Project — Plastic-pollution Free Lagos Project. An Initiative of Heritage Promotion.</image:caption>
     </image:image>
     <image:image>
-      <image:loc>https://pflproject.com/logo.png</image:loc>
+      <image:loc>https://www.pflproject.org/logo.png</image:loc>
       <image:title>PFL Project Logo</image:title>
     </image:image>
   </url>
   <url>
-    <loc>https://pflproject.com/lagos-and-plastics</loc>
+    <loc>https://www.pflproject.org/lagos-and-plastics</loc>
     <lastmod>2026-07-02</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.9</priority>
   </url>
   <url>
-    <loc>https://pflproject.com/partners</loc>
+    <loc>https://www.pflproject.org/partners</loc>
     <lastmod>2026-07-02</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.8</priority>
   </url>
   <url>
-    <loc>https://pflproject.com/contact</loc>
+    <loc>https://www.pflproject.org/contact</loc>
     <lastmod>2026-07-02</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.7</priority>

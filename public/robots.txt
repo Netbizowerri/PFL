@@ -1,13 +1,13 @@
 # robots.txt for PFL Project — Plastic-pollution Free Lagos Project
-# https://pflproject.com
+# https://www.pflproject.org
 
 # ─── Sitemap ─────────────────────────────────────────────────────────────────────
-Sitemap: https://pflproject.com/sitemap.xml
+Sitemap: https://www.pflproject.org/sitemap.xml
 
 # ─── LLMs (AI Discovery) ──────────────────────────────────────────────────────────
 # This file helps AI assistants discover and cite the website.
 # https://llmstxt.org/
-Link: https://pflproject.com/llms.txt; rel="llms.txt"
+Link: https://www.pflproject.org/llms.txt; rel="llms.txt"
 
 # ─── AI Search / Generative Engine Crawlers ────────────────────────────────────────
 # These directives help manage how AI search engines index the site (GEO optimization).

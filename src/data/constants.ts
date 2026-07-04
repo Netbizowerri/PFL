@@ -1,7 +1,7 @@
 export const SITE = {
   name: "PFL Project",
   tagline: "An Initiative of Heritage Promotion",
-  email: "pflproject@gmail.com",
+  email: "info@pflproject.org",
   phone: "+234 915 258 8491",
   phoneRaw: "2349152588491",
   address: "Plot 10 Ikere Estate. Araromi Ale. Badagry Lagos Nigeria.",

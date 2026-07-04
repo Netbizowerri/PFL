@@ -10,12 +10,12 @@ import type { HelmetProps } from "react-helmet-async";
 export const SITE_CONFIG = {
   name: "Plastic-pollution Free Lagos Project",
   shortName: "PFL Project",
-  url: "https://pflproject.com",
-  domain: "pflproject.com",
+  url: "https://www.pflproject.org",
+  domain: "www.pflproject.org",
   tagline: "An Initiative of Heritage Promotion",
   description:
     "Plastic-pollution Free Lagos Project (PFL Project) — a grassroots initiative of Heritage Promotion bridging Lagos State climate action and community execution through CDA training, plastic shredders and plastic waste banks.",
-  email: "pflproject@gmail.com",
+  email: "info@pflproject.org",
   phone: "+2349152588491",
   address: {
     street: "Plot 10 Ikere Estate, Araromi Ale",
